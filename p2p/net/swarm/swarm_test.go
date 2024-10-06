@@ -21,11 +21,11 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 	. "github.com/libp2p/go-libp2p/p2p/net/swarm/testing"
 
-	"github.com/golang/mock/gomock"
 	logging "github.com/ipfs/go-log/v2"
 	ma "github.com/multiformats/go-multiaddr"
 	manet "github.com/multiformats/go-multiaddr/net"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
 )
 
 var log = logging.Logger("swarm_test")
@@ -390,7 +390,7 @@ func TestTypedNilConn(t *testing.T) {
 
 func TestPreventDialListenAddr(t *testing.T) {
 	s := GenSwarm(t, OptDialOnly)
-	if err := s.Listen(ma.StringCast("/ip4/0.0.0.0/udp/0/quic")); err != nil {
+	if err := s.Listen(ma.StringCast("/ip4/0.0.0.0/udp/0/quic-v1")); err != nil {
 		t.Fatal(err)
 	}
 	addrs, err := s.InterfaceListenAddresses()
@@ -445,16 +445,16 @@ func TestStreamCount(t *testing.T) {
 		<-streamAccepted
 	}
 	require.Eventually(t, func() bool { return len(streams) == 10 }, 5*time.Second, 10*time.Millisecond)
-	require.Equal(t, countStreams(), 10)
+	require.Equal(t, 10, countStreams())
 	(<-streams).Reset()
 	(<-streams).Close()
-	require.Equal(t, countStreams(), 8)
+	require.Equal(t, 8, countStreams())
 
 	str, err := s1.NewStream(context.Background(), s2.LocalPeer())
 	require.NoError(t, err)
-	require.Equal(t, countStreams(), 9)
+	require.Equal(t, 9, countStreams())
 	str.Close()
-	require.Equal(t, countStreams(), 8)
+	require.Equal(t, 8, countStreams())
 }
 
 func TestResourceManager(t *testing.T) {
@@ -545,17 +545,26 @@ func TestListenCloseCount(t *testing.T) {
 	s := GenSwarm(t, OptDialOnly)
 	addrsToListen := []ma.Multiaddr{
 		ma.StringCast("/ip4/0.0.0.0/tcp/0"),
-		ma.StringCast("/ip4/0.0.0.0/udp/0/quic"),
+		ma.StringCast("/ip4/0.0.0.0/udp/0/quic-v1"),
 	}
 
 	if err := s.Listen(addrsToListen...); err != nil {
 		t.Fatal(err)
 	}
 	listenedAddrs := s.ListenAddresses()
-	require.Equal(t, 2, len(listenedAddrs))
+	require.Len(t, listenedAddrs, 2)
+	var addrToClose ma.Multiaddr
+	for _, addr := range listenedAddrs {
+		if _, err := addr.ValueForProtocol(ma.P_QUIC_V1); err == nil {
+			// make a copy of the address to make sure the multiaddr comparison actually works
+			addrToClose = ma.StringCast(addr.String())
+		}
+	}
 
-	s.ListenClose(listenedAddrs...)
+	s.ListenClose(addrToClose)
 
 	remainingAddrs := s.ListenAddresses()
-	require.Equal(t, 0, len(remainingAddrs))
+	require.Len(t, remainingAddrs, 1)
+	_, err := remainingAddrs[0].ValueForProtocol(ma.P_TCP)
+	require.NoError(t, err, "expected the TCP address to still be present")
 }

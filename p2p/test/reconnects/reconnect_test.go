@@ -37,6 +37,7 @@ func TestReconnect5(t *testing.T) {
 			h, err := bhost.NewHost(swarmt.GenSwarm(t, swarmOpt), nil)
 			require.NoError(t, err)
 			defer h.Close()
+			h.Start()
 			hosts = append(hosts, h)
 			h.SetStreamHandler(protocol.TestingID, EchoStreamHandler)
 		}
@@ -71,6 +72,7 @@ func runRound(t *testing.T, hosts []host.Host) {
 		numStreams = 5
 		maxDataLen = 64 << 10
 	)
+	rnd := rand.New(rand.NewSource(12345))
 	// exchange some data
 	for _, h1 := range hosts {
 		for _, h2 := range hosts {
@@ -80,10 +82,10 @@ func runRound(t *testing.T, hosts []host.Host) {
 			var wg sync.WaitGroup
 			wg.Add(numStreams)
 			for i := 0; i < numStreams; i++ {
+				data := make([]byte, rand.Intn(maxDataLen)+1)
+				rnd.Read(data)
 				go func() {
 					defer wg.Done()
-					data := make([]byte, rand.Intn(maxDataLen)+1)
-					rand.Read(data)
 					str, err := h1.NewStream(context.Background(), h2.ID(), protocol.TestingID)
 					require.NoError(t, err)
 					defer str.Close()

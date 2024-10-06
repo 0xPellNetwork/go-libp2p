@@ -3,6 +3,7 @@ package rcmgr
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +14,7 @@ import (
 
 	logging "github.com/ipfs/go-log/v2"
 	"github.com/multiformats/go-multiaddr"
+	manet "github.com/multiformats/go-multiaddr/net"
 )
 
 var log = logging.Logger("rcmgr")
@@ -20,8 +22,11 @@ var log = logging.Logger("rcmgr")
 type resourceManager struct {
 	limits Limiter
 
-	trace   *trace
-	metrics *metrics
+	connLimiter *connLimiter
+
+	trace          *trace
+	metrics        *metrics
+	disableMetrics bool
 
 	allowlist *Allowlist
 
@@ -102,6 +107,7 @@ type connectionScope struct {
 	rcmgr         *resourceManager
 	peer          *peerScope
 	endpoint      multiaddr.Multiaddr
+	ip            netip.Addr
 }
 
 var _ network.ConnScope = (*connectionScope)(nil)
@@ -128,16 +134,61 @@ type Option func(*resourceManager) error
 func NewResourceManager(limits Limiter, opts ...Option) (network.ResourceManager, error) {
 	allowlist := newAllowlist()
 	r := &resourceManager{
-		limits:    limits,
-		allowlist: &allowlist,
-		svc:       make(map[string]*serviceScope),
-		proto:     make(map[protocol.ID]*protocolScope),
-		peer:      make(map[peer.ID]*peerScope),
+		limits:      limits,
+		connLimiter: newConnLimiter(),
+		allowlist:   &allowlist,
+		svc:         make(map[string]*serviceScope),
+		proto:       make(map[protocol.ID]*protocolScope),
+		peer:        make(map[peer.ID]*peerScope),
 	}
 
 	for _, opt := range opts {
 		if err := opt(r); err != nil {
 			return nil, err
+		}
+	}
+
+	registeredConnLimiterPrefixes := make(map[string]struct{})
+	for _, npLimit := range r.connLimiter.networkPrefixLimitV4 {
+		registeredConnLimiterPrefixes[npLimit.Network.String()] = struct{}{}
+	}
+	for _, npLimit := range r.connLimiter.networkPrefixLimitV6 {
+		registeredConnLimiterPrefixes[npLimit.Network.String()] = struct{}{}
+	}
+	for _, network := range allowlist.allowedNetworks {
+		prefix, err := netip.ParsePrefix(network.String())
+		if err != nil {
+			log.Debugf("failed to parse prefix from allowlist %s, %s", network, err)
+			continue
+		}
+		if _, ok := registeredConnLimiterPrefixes[prefix.String()]; !ok {
+			// connlimiter doesn't know about this network. Let's fix that
+			r.connLimiter.addNetworkPrefixLimit(prefix.Addr().Is6(), NetworkPrefixLimit{
+				Network:   prefix,
+				ConnCount: r.limits.GetAllowlistedSystemLimits().GetConnTotalLimit(),
+			})
+		}
+	}
+
+	if !r.disableMetrics {
+		var sr TraceReporter
+		sr, err := NewStatsTraceReporter()
+		if err != nil {
+			log.Errorf("failed to initialise StatsTraceReporter %s", err)
+		} else {
+			if r.trace == nil {
+				r.trace = &trace{}
+			}
+			found := false
+			for _, rep := range r.trace.reporters {
+				if rep == sr {
+					found = true
+					break
+				}
+			}
+			if !found {
+				r.trace.reporters = append(r.trace.reporters, sr)
+			}
 		}
 	}
 
@@ -287,12 +338,37 @@ func (r *resourceManager) nextStreamId() int64 {
 	return r.streamId
 }
 
+// OpenConnectionNoIP is deprecated and will be removed in the next release
+func (r *resourceManager) OpenConnectionNoIP(dir network.Direction, usefd bool, endpoint multiaddr.Multiaddr) (network.ConnManagementScope, error) {
+	return r.openConnection(dir, usefd, endpoint, netip.Addr{})
+}
+
 func (r *resourceManager) OpenConnection(dir network.Direction, usefd bool, endpoint multiaddr.Multiaddr) (network.ConnManagementScope, error) {
+	ip, err := manet.ToIP(endpoint)
+	if err != nil {
+		// No IP address
+		return r.openConnection(dir, usefd, endpoint, netip.Addr{})
+	}
+
+	ipAddr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return nil, fmt.Errorf("failed to convert ip to netip.Addr")
+	}
+	return r.openConnection(dir, usefd, endpoint, ipAddr)
+}
+
+func (r *resourceManager) openConnection(dir network.Direction, usefd bool, endpoint multiaddr.Multiaddr, ip netip.Addr) (network.ConnManagementScope, error) {
+	if ip.IsValid() {
+		if ok := r.connLimiter.addConn(ip); !ok {
+			return nil, fmt.Errorf("connections per ip limit exceeded for %s", endpoint)
+		}
+	}
+
 	var conn *connectionScope
-	conn = newConnectionScope(dir, usefd, r.limits.GetConnLimits(), r, endpoint)
+	conn = newConnectionScope(dir, usefd, r.limits.GetConnLimits(), r, endpoint, ip)
 
 	err := conn.AddConn(dir, usefd)
-	if err != nil {
+	if err != nil && ip.IsValid() {
 		// Try again if this is an allowlisted connection
 		// Failed to open connection, let's see if this was allowlisted and try again
 		allowed := r.allowlist.Allowed(endpoint)
@@ -453,7 +529,7 @@ func newPeerScope(p peer.ID, limit Limit, rcmgr *resourceManager) *peerScope {
 	}
 }
 
-func newConnectionScope(dir network.Direction, usefd bool, limit Limit, rcmgr *resourceManager, endpoint multiaddr.Multiaddr) *connectionScope {
+func newConnectionScope(dir network.Direction, usefd bool, limit Limit, rcmgr *resourceManager, endpoint multiaddr.Multiaddr, ip netip.Addr) *connectionScope {
 	return &connectionScope{
 		resourceScope: newResourceScope(limit,
 			[]*resourceScope{rcmgr.transient.resourceScope, rcmgr.system.resourceScope},
@@ -462,6 +538,7 @@ func newConnectionScope(dir network.Direction, usefd bool, limit Limit, rcmgr *r
 		usefd:    usefd,
 		rcmgr:    rcmgr,
 		endpoint: endpoint,
+		ip:       ip,
 	}
 }
 
@@ -618,6 +695,18 @@ func (s *connectionScope) PeerScope() network.PeerScope {
 	}
 
 	return s.peer
+}
+
+func (s *connectionScope) Done() {
+	s.Lock()
+	defer s.Unlock()
+	if s.done {
+		return
+	}
+	if s.ip.IsValid() {
+		s.rcmgr.connLimiter.rmConn(s.ip)
+	}
+	s.resourceScope.doneUnlocked()
 }
 
 // transferAllowedToStandard transfers this connection scope from being part of

@@ -159,15 +159,16 @@ func TestKeys(t *testing.T) {
 	defer initConn.Close()
 	defer respConn.Close()
 
-	sk := respConn.LocalPrivateKey()
-	pk := sk.GetPublic()
-
-	if !sk.Equals(respTransport.privateKey) {
-		t.Error("Private key Mismatch.")
+	pk1 := respConn.RemotePublicKey()
+	pk2 := initTransport.privateKey.GetPublic()
+	if !pk1.Equals(pk2) {
+		t.Errorf("Public key mismatch. expected %x got %x", pk1, pk2)
 	}
 
-	if !pk.Equals(initConn.RemotePublicKey()) {
-		t.Errorf("Public key mismatch. expected %x got %x", pk, initConn.RemotePublicKey())
+	pk3 := initConn.RemotePublicKey()
+	pk4 := respTransport.privateKey.GetPublic()
+	if !pk3.Equals(pk4) {
+		t.Errorf("Public key mismatch. expected %x got %x", pk3, pk4)
 	}
 }
 
@@ -181,16 +182,16 @@ func TestPeerIDMatch(t *testing.T) {
 		defer close(done)
 		conn, err := initTransport.SecureOutbound(context.Background(), init, respTransport.localID)
 		assert.NoError(t, err)
-		assert.Equal(t, conn.RemotePeer(), respTransport.localID)
+		assert.Equal(t, respTransport.localID, conn.RemotePeer())
 		b := make([]byte, 6)
 		_, err = conn.Read(b)
 		assert.NoError(t, err)
-		assert.Equal(t, b, []byte("foobar"))
+		assert.Equal(t, []byte("foobar"), b)
 	}()
 
 	conn, err := respTransport.SecureInbound(context.Background(), resp, initTransport.localID)
 	require.NoError(t, err)
-	require.Equal(t, conn.RemotePeer(), initTransport.localID)
+	require.Equal(t, initTransport.localID, conn.RemotePeer())
 	_, err = conn.Write([]byte("foobar"))
 	require.NoError(t, err)
 }
@@ -211,7 +212,10 @@ func TestPeerIDMismatchOutboundFailsHandshake(t *testing.T) {
 
 	initErr := <-errChan
 	require.Error(t, initErr, "expected initiator to fail with peer ID mismatch error")
-	require.Contains(t, initErr.Error(), "but remote key matches")
+	var mismatchErr sec.ErrPeerIDMismatch
+	require.ErrorAs(t, initErr, &mismatchErr)
+	require.Equal(t, mismatchErr.Expected, peer.ID("a-random-peer-id"))
+	require.Equal(t, mismatchErr.Actual, respTransport.localID)
 }
 
 func TestPeerIDMismatchInboundFailsHandshake(t *testing.T) {
@@ -230,6 +234,10 @@ func TestPeerIDMismatchInboundFailsHandshake(t *testing.T) {
 
 	_, err := respTransport.SecureInbound(context.Background(), resp, "a-random-peer-id")
 	require.Error(t, err, "expected responder to fail with peer ID mismatch error")
+	var mismatchErr sec.ErrPeerIDMismatch
+	require.ErrorAs(t, err, &mismatchErr)
+	require.Equal(t, mismatchErr.Expected, peer.ID("a-random-peer-id"))
+	require.Equal(t, mismatchErr.Actual, initTransport.localID)
 	<-done
 }
 
@@ -271,12 +279,6 @@ func TestPeerIDOutboundNoCheck(t *testing.T) {
 	require.NoError(t, initErr)
 }
 
-func makeLargePlaintext(size int) []byte {
-	buf := make([]byte, size)
-	rand.Read(buf)
-	return buf
-}
-
 func TestLargePayloads(t *testing.T) {
 	initTransport := newTestTransport(t, crypto.Ed25519, 2048)
 	respTransport := newTestTransport(t, crypto.Ed25519, 2048)
@@ -287,11 +289,12 @@ func TestLargePayloads(t *testing.T) {
 
 	// enough to require a couple Noise messages, with a size that
 	// isn't a neat multiple of Noise message size, just in case
-	size := 100000
+	rnd := rand.New(rand.NewSource(1234))
+	const size = 100000
+	before := make([]byte, size)
+	rnd.Read(before)
 
-	before := makeLargePlaintext(size)
-	_, err := initConn.Write(before)
-	if err != nil {
+	if _, err := initConn.Write(before); err != nil {
 		t.Fatal(err)
 	}
 
@@ -351,7 +354,7 @@ func TestBufferEqEncPayload(t *testing.T) {
 	afterLen, err := respConn.Read(after)
 	require.NoError(t, err)
 
-	require.Equal(t, len(before), afterLen)
+	require.Len(t, before, afterLen)
 	require.Equal(t, before, after[:len(before)])
 }
 
@@ -371,7 +374,7 @@ func TestBufferEqDecryptedPayload(t *testing.T) {
 	afterLen, err := respConn.Read(after)
 	require.NoError(t, err)
 
-	require.Equal(t, len(before), afterLen)
+	require.Len(t, before, afterLen)
 	require.Equal(t, before, after[:len(before)])
 }
 
@@ -390,7 +393,7 @@ func TestReadUnencryptedFails(t *testing.T) {
 	copy(msg[LengthPrefixLength:], before)
 	n, err := initConn.insecureConn.Write(msg)
 	require.NoError(t, err)
-	require.Equal(t, len(msg), n)
+	require.Len(t, msg, n)
 
 	after := make([]byte, len(msg)+1)
 	afterLen, err := respConn.Read(after)
@@ -411,7 +414,7 @@ func TestReadUnencryptedFails(t *testing.T) {
 	copy(msg[LengthPrefixLength:], before)
 	n, err = initConn.insecureConn.Write(msg)
 	require.NoError(t, err)
-	require.Equal(t, len(msg), n)
+	require.Len(t, msg, n)
 
 	after = make([]byte, 1)
 	afterLen, err = respConn.Read(after)
@@ -592,7 +595,6 @@ func TestEarlyDataRejected(t *testing.T) {
 		clientErr, serverErr := handshake(t, sendingEDH, receivingEDH)
 		require.Error(t, clientErr)
 		require.EqualError(t, serverErr, "nope")
-
 	})
 
 	t.Run("server sending", func(t *testing.T) {
@@ -691,7 +693,9 @@ func TestHandshakeWithTransportEarlyData(t *testing.T) {
 		defer respConn.Close()
 
 		require.Equal(t, expectedProto, initConn.connectionState.StreamMultiplexer)
+		require.Equal(t, expectedProto != "", initConn.connectionState.UsedEarlyMuxerNegotiation)
 		require.Equal(t, expectedProto, respConn.connectionState.StreamMultiplexer)
+		require.Equal(t, expectedProto != "", respConn.connectionState.UsedEarlyMuxerNegotiation)
 
 		initData := []byte("Test data for noise transport")
 		_, err := initConn.Write(initData)

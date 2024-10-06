@@ -3,9 +3,13 @@
 
 package protocols_p2p
 
-import proto "github.com/gogo/protobuf/proto"
-import fmt "fmt"
-import math "math"
+import (
+	fmt "fmt"
+
+	proto "github.com/gogo/protobuf/proto"
+
+	math "math"
+)
 
 // Reference imports to suppress errors if they are not otherwise used.
 var _ = proto.Marshal
@@ -106,7 +110,7 @@ func (m *MessageData) GetSign() []byte {
 	return nil
 }
 
-// a protocol define a set of reuqest and responses
+// A protocol defines a set of requests and responses.
 type PingRequest struct {
 	MessageData *MessageData `protobuf:"bytes,1,opt,name=messageData" json:"messageData,omitempty"`
 	// method specific data
@@ -201,7 +205,7 @@ func (m *PingResponse) GetMessage() string {
 	return ""
 }
 
-// a protocol define a set of reuqest and responses
+// A protocol defines a set of requests and responses
 type EchoRequest struct {
 	MessageData *MessageData `protobuf:"bytes,1,opt,name=messageData" json:"messageData,omitempty"`
 	// method specific data

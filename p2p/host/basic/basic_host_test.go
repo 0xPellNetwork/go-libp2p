@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -40,9 +41,11 @@ func TestHostSimple(t *testing.T) {
 	h1, err := NewHost(swarmt.GenSwarm(t), nil)
 	require.NoError(t, err)
 	defer h1.Close()
+	h1.Start()
 	h2, err := NewHost(swarmt.GenSwarm(t), nil)
 	require.NoError(t, err)
 	defer h2.Close()
+	h2.Start()
 
 	h2pi := h2.Peerstore().PeerInfo(h2.ID())
 	require.NoError(t, h1.Connect(ctx, h2pi))
@@ -250,7 +253,7 @@ func getHostPair(t *testing.T) (host.Host, host.Host) {
 	require.NoError(t, err)
 	h2.Start()
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	h2pi := h2.Peerstore().PeerInfo(h2.ID())
 	require.NoError(t, h1.Connect(ctx, h2pi))
@@ -344,11 +347,11 @@ func TestHostProtoMismatch(t *testing.T) {
 }
 
 func TestHostProtoPreknowledge(t *testing.T) {
-	h1, err := NewHost(swarmt.GenSwarm(t), nil)
+	h1, err := NewHost(swarmt.GenSwarm(t, swarmt.OptDialOnly), nil)
 	require.NoError(t, err)
 	defer h1.Close()
 
-	h2, err := NewHost(swarmt.GenSwarm(t), nil)
+	h2, err := NewHost(swarmt.GenSwarm(t, swarmt.OptDisableTCP), nil)
 	require.NoError(t, err)
 	defer h2.Close()
 
@@ -359,14 +362,22 @@ func TestHostProtoPreknowledge(t *testing.T) {
 	}
 
 	h2.SetStreamHandler("/super", handler)
-	// Prevent pushing identify information so this test actually _uses_ the super protocol.
-	h1.RemoveStreamHandler(identify.IDPush)
 
 	h1.Start()
 	h2.Start()
 
+	// Prevent pushing identify information so this test actually _uses_ the super protocol.
+	h1.RemoveStreamHandler(identify.IDPush)
+
 	h2pi := h2.Peerstore().PeerInfo(h2.ID())
+	// Filter to only 1 address so that we don't have to think about parallel
+	// connections in this test
+	h2pi.Addrs = h2pi.Addrs[:1]
 	require.NoError(t, h1.Connect(context.Background(), h2pi))
+
+	// This test implicitly relies on 1 connection. If a background identify
+	// completes after we set the stream handler below things break
+	require.Len(t, h1.Network().ConnsToPeer(h2.ID()), 1)
 
 	// wait for identify handshake to finish completely
 	select {
@@ -382,6 +393,17 @@ func TestHostProtoPreknowledge(t *testing.T) {
 	}
 
 	h2.SetStreamHandler("/foo", handler)
+
+	require.Never(t, func() bool {
+		protos, err := h1.Peerstore().GetProtocols(h2.ID())
+		require.NoError(t, err)
+		for _, p := range protos {
+			if p == "/foo" {
+				return true
+			}
+		}
+		return false
+	}, time.Second, 100*time.Millisecond)
 
 	s, err := h1.NewStream(context.Background(), h2.ID(), "/foo", "/bar", "/super")
 	require.NoError(t, err)
@@ -427,8 +449,10 @@ func TestNewDialOld(t *testing.T) {
 func TestNewStreamResolve(t *testing.T) {
 	h1, err := NewHost(swarmt.GenSwarm(t), nil)
 	require.NoError(t, err)
+	h1.Start()
 	h2, err := NewHost(swarmt.GenSwarm(t), nil)
 	require.NoError(t, err)
+	h2.Start()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -445,7 +469,7 @@ func TestNewStreamResolve(t *testing.T) {
 			break
 		}
 	}
-	assert.NotEqual(t, dialAddr, "")
+	assert.NotEqual(t, "", dialAddr)
 
 	// Add the DNS multiaddr to h1's peerstore.
 	maddr, err := ma.NewMultiaddr(dialAddr)
@@ -482,7 +506,7 @@ func TestProtoDowngrade(t *testing.T) {
 		defer s.Close()
 		result, err := io.ReadAll(s)
 		assert.NoError(t, err)
-		assert.Equal(t, string(result), "bar")
+		assert.Equal(t, "bar", string(result))
 		connectedOn <- s.Protocol()
 	})
 
@@ -503,7 +527,7 @@ func TestProtoDowngrade(t *testing.T) {
 		defer s.Close()
 		result, err := io.ReadAll(s)
 		assert.NoError(t, err)
-		assert.Equal(t, string(result), "foo")
+		assert.Equal(t, "foo", string(result))
 		connectedOn <- s.Protocol()
 	})
 
@@ -715,7 +739,7 @@ func TestNegotiationCancel(t *testing.T) {
 
 	select {
 	case err := <-errCh:
-		require.Equal(t, err, context.Canceled)
+		require.ErrorIs(t, err, context.Canceled)
 	case <-time.After(500 * time.Millisecond):
 		// failed to cancel
 		t.Fatal("expected negotiation to be canceled")
@@ -791,4 +815,136 @@ func peerRecordFromEnvelope(t *testing.T, ev *record.Envelope) *peer.PeerRecord 
 		return nil
 	}
 	return peerRec
+}
+
+func TestNormalizeMultiaddr(t *testing.T) {
+	h1, err := NewHost(swarmt.GenSwarm(t), nil)
+	require.NoError(t, err)
+	defer h1.Close()
+
+	require.Equal(t, "/ip4/1.2.3.4/udp/9999/quic-v1/webtransport", h1.NormalizeMultiaddr(ma.StringCast("/ip4/1.2.3.4/udp/9999/quic-v1/webtransport/certhash/uEgNmb28")).String())
+}
+
+func TestInferWebtransportAddrsFromQuic(t *testing.T) {
+	type testCase struct {
+		name string
+		in   []string
+		out  []string
+	}
+
+	testCases := []testCase{
+		{
+			name: "Happy Path",
+			in:   []string{"/ip4/0.0.0.0/udp/9999/quic-v1", "/ip4/0.0.0.0/udp/9999/quic-v1/webtransport", "/ip4/1.2.3.4/udp/9999/quic-v1"},
+			out:  []string{"/ip4/0.0.0.0/udp/9999/quic-v1", "/ip4/0.0.0.0/udp/9999/quic-v1/webtransport", "/ip4/1.2.3.4/udp/9999/quic-v1", "/ip4/1.2.3.4/udp/9999/quic-v1/webtransport"},
+		},
+		{
+			name: "Happy Path With CertHashes",
+			in:   []string{"/ip4/0.0.0.0/udp/9999/quic-v1", "/ip4/0.0.0.0/udp/9999/quic-v1/webtransport/certhash/uEgNmb28/certhash/uEgNmb28", "/ip4/1.2.3.4/udp/9999/quic-v1"},
+			out:  []string{"/ip4/0.0.0.0/udp/9999/quic-v1", "/ip4/0.0.0.0/udp/9999/quic-v1/webtransport/certhash/uEgNmb28/certhash/uEgNmb28", "/ip4/1.2.3.4/udp/9999/quic-v1", "/ip4/1.2.3.4/udp/9999/quic-v1/webtransport"},
+		},
+		{
+			name: "Already discovered",
+			in:   []string{"/ip4/0.0.0.0/udp/9999/quic-v1", "/ip4/0.0.0.0/udp/9999/quic-v1/webtransport", "/ip4/1.2.3.4/udp/9999/quic-v1", "/ip4/1.2.3.4/udp/9999/quic-v1/webtransport"},
+			out:  []string{"/ip4/0.0.0.0/udp/9999/quic-v1", "/ip4/0.0.0.0/udp/9999/quic-v1/webtransport", "/ip4/1.2.3.4/udp/9999/quic-v1", "/ip4/1.2.3.4/udp/9999/quic-v1/webtransport"},
+		},
+		{
+			name: "Infer Many",
+			in:   []string{"/ip4/0.0.0.0/udp/9999/quic-v1", "/ip4/0.0.0.0/udp/9999/quic-v1/webtransport", "/ip4/1.2.3.4/udp/9999/quic-v1", "/ip4/4.3.2.1/udp/9999/quic-v1"},
+			out:  []string{"/ip4/0.0.0.0/udp/9999/quic-v1", "/ip4/0.0.0.0/udp/9999/quic-v1/webtransport", "/ip4/1.2.3.4/udp/9999/quic-v1", "/ip4/4.3.2.1/udp/9999/quic-v1", "/ip4/1.2.3.4/udp/9999/quic-v1/webtransport", "/ip4/4.3.2.1/udp/9999/quic-v1/webtransport"},
+		},
+		{
+			name: "No Common listeners",
+			in:   []string{"/ip4/0.0.0.0/udp/9999/quic-v1", "/ip4/0.0.0.0/udp/1111/quic-v1/webtransport", "/ip4/1.2.3.4/udp/9999/quic-v1"},
+			out:  []string{"/ip4/0.0.0.0/udp/9999/quic-v1", "/ip4/0.0.0.0/udp/1111/quic-v1/webtransport", "/ip4/1.2.3.4/udp/9999/quic-v1"},
+		},
+		{
+			name: "No WebTransport",
+			in:   []string{"/ip4/0.0.0.0/udp/9999/quic-v1", "/ip4/1.2.3.4/udp/9999/quic-v1"},
+			out:  []string{"/ip4/0.0.0.0/udp/9999/quic-v1", "/ip4/1.2.3.4/udp/9999/quic-v1"},
+		},
+	}
+
+	// Make sure the testCases are all valid multiaddrs
+	for _, tc := range testCases {
+		for _, addr := range tc.in {
+			_, err := ma.NewMultiaddr(addr)
+			require.NoError(t, err)
+		}
+		for _, addr := range tc.out {
+			_, err := ma.NewMultiaddr(addr)
+			require.NoError(t, err)
+		}
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			sort.StringSlice(tc.in).Sort()
+			sort.StringSlice(tc.out).Sort()
+			min := make([]ma.Multiaddr, 0, len(tc.in))
+			for _, addr := range tc.in {
+				min = append(min, ma.StringCast(addr))
+			}
+			outMa := inferWebtransportAddrsFromQuic(min)
+			outStr := make([]string, 0, len(outMa))
+			for _, addr := range outMa {
+				outStr = append(outStr, addr.String())
+			}
+			require.Equal(t, tc.out, outStr)
+		})
+
+	}
+
+}
+
+func TestTrimHostAddrList(t *testing.T) {
+	type testCase struct {
+		name      string
+		in        []ma.Multiaddr
+		threshold int
+		out       []ma.Multiaddr
+	}
+
+	tcpPublic := ma.StringCast("/ip4/1.1.1.1/tcp/1")
+	quicPublic := ma.StringCast("/ip4/1.1.1.1/udp/1/quic-v1")
+
+	tcpPrivate := ma.StringCast("/ip4/192.168.1.1/tcp/1")
+	quicPrivate := ma.StringCast("/ip4/192.168.1.1/udp/1/quic-v1")
+
+	tcpLocal := ma.StringCast("/ip4/127.0.0.1/tcp/1")
+	quicLocal := ma.StringCast("/ip4/127.0.0.1/udp/1/quic-v1")
+
+	testCases := []testCase{
+		{
+			name:      "Public preferred over private",
+			in:        []ma.Multiaddr{tcpPublic, quicPrivate},
+			threshold: len(tcpLocal.Bytes()),
+			out:       []ma.Multiaddr{tcpPublic},
+		},
+		{
+			name:      "Public and private preffered over local",
+			in:        []ma.Multiaddr{tcpPublic, tcpPrivate, quicLocal},
+			threshold: len(tcpPublic.Bytes()) + len(tcpPrivate.Bytes()),
+			out:       []ma.Multiaddr{tcpPublic, tcpPrivate},
+		},
+		{
+			name:      "quic preferred over tcp",
+			in:        []ma.Multiaddr{tcpPublic, quicPublic},
+			threshold: len(quicPublic.Bytes()),
+			out:       []ma.Multiaddr{quicPublic},
+		},
+		{
+			name:      "no filtering on large threshold",
+			in:        []ma.Multiaddr{tcpPublic, quicPublic, quicLocal, tcpLocal, tcpPrivate},
+			threshold: 10000,
+			out:       []ma.Multiaddr{tcpPublic, quicPublic, quicLocal, tcpLocal, tcpPrivate},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := trimHostAddrList(tc.in, tc.threshold)
+			require.ElementsMatch(t, got, tc.out)
+		})
+	}
 }

@@ -3,25 +3,28 @@ package relay_test
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"fmt"
 	"io"
-	"math/rand"
 	"testing"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/metrics"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/transport"
 	bhost "github.com/libp2p/go-libp2p/p2p/host/blank"
+	"github.com/libp2p/go-libp2p/p2p/host/eventbus"
 	"github.com/libp2p/go-libp2p/p2p/host/peerstore/pstoremem"
 	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 	swarmt "github.com/libp2p/go-libp2p/p2p/net/swarm/testing"
 	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
 	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
+	"github.com/stretchr/testify/require"
 
 	ma "github.com/multiformats/go-multiaddr"
 )
@@ -48,7 +51,8 @@ func getNetHosts(t *testing.T, ctx context.Context, n int) (hosts []host.Host, u
 		}
 
 		bwr := metrics.NewBandwidthCounter()
-		netw, err := swarm.NewSwarm(p, ps, swarm.WithMetrics(bwr))
+		bus := eventbus.NewBus()
+		netw, err := swarm.NewSwarm(p, ps, bus, swarm.WithMetrics(bwr))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -69,7 +73,7 @@ func getNetHosts(t *testing.T, ctx context.Context, n int) (hosts []host.Host, u
 			t.Fatal(err)
 		}
 
-		h := bhost.NewBlankHost(netw)
+		h := bhost.NewBlankHost(netw, bhost.WithEventBus(bus))
 
 		hosts = append(hosts, h)
 	}
@@ -144,20 +148,41 @@ func TestBasicRelay(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	sub, err := hosts[2].EventBus().Subscribe(new(event.EvtPeerConnectednessChanged))
+	require.NoError(t, err)
+
 	err = hosts[2].Connect(ctx, peer.AddrInfo{ID: hosts[0].ID(), Addrs: []ma.Multiaddr{raddr}})
 	if err != nil {
 		t.Fatal(err)
+	}
+	for {
+		var e interface{}
+		select {
+		case e = <-sub.Out():
+		case <-time.After(2 * time.Second):
+			t.Fatal("expected limited connectivity event")
+		}
+		evt, ok := e.(event.EvtPeerConnectednessChanged)
+		if !ok {
+			t.Fatalf("invalid event: %s", e)
+		}
+		if evt.Peer == hosts[0].ID() {
+			if evt.Connectedness != network.Limited {
+				t.Fatalf("expected limited connectivity %s", evt.Connectedness)
+			}
+			break
+		}
 	}
 
 	conns := hosts[2].Network().ConnsToPeer(hosts[0].ID())
 	if len(conns) != 1 {
 		t.Fatalf("expected 1 connection, but got %d", len(conns))
 	}
-	if !conns[0].Stat().Transient {
+	if !conns[0].Stat().Limited {
 		t.Fatal("expected transient connection")
 	}
 
-	s, err := hosts[2].NewStream(network.WithUseTransient(ctx, "test"), hosts[0].ID(), "test")
+	s, err := hosts[2].NewStream(network.WithAllowLimitedConn(ctx, "test"), hosts[0].ID(), "test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,11 +253,11 @@ func TestRelayLimitTime(t *testing.T) {
 	if len(conns) != 1 {
 		t.Fatalf("expected 1 connection, but got %d", len(conns))
 	}
-	if !conns[0].Stat().Transient {
+	if !conns[0].Stat().Limited {
 		t.Fatal("expected transient connection")
 	}
 
-	s, err := hosts[2].NewStream(network.WithUseTransient(ctx, "test"), hosts[0].ID(), "test")
+	s, err := hosts[2].NewStream(network.WithAllowLimitedConn(ctx, "test"), hosts[0].ID(), "test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -314,19 +339,18 @@ func TestRelayLimitData(t *testing.T) {
 	if len(conns) != 1 {
 		t.Fatalf("expected 1 connection, but got %d", len(conns))
 	}
-	if !conns[0].Stat().Transient {
+	if !conns[0].Stat().Limited {
 		t.Fatal("expected transient connection")
 	}
 
-	s, err := hosts[2].NewStream(network.WithUseTransient(ctx, "test"), hosts[0].ID(), "test")
+	s, err := hosts[2].NewStream(network.WithAllowLimitedConn(ctx, "test"), hosts[0].ID(), "test")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	buf := make([]byte, 1024)
 	for i := 0; i < 3; i++ {
-		_, err = rand.Read(buf)
-		if err != nil {
+		if _, err := rand.Read(buf); err != nil {
 			t.Fatal(err)
 		}
 
@@ -345,8 +369,7 @@ func TestRelayLimitData(t *testing.T) {
 	}
 
 	buf = make([]byte, 4096)
-	_, err = rand.Read(buf)
-	if err != nil {
+	if _, err := rand.Read(buf); err != nil {
 		t.Fatal(err)
 	}
 

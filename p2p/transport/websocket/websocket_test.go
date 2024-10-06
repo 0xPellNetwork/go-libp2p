@@ -308,6 +308,16 @@ func TestWebsocketTransport(t *testing.T) {
 	ttransport.SubtestTransport(t, ta, tb, "/ip4/127.0.0.1/tcp/0/ws", "peerA")
 }
 
+func isWSS(addr ma.Multiaddr) bool {
+	if _, err := addr.ValueForProtocol(ma.P_WSS); err == nil {
+		return true
+	}
+	if _, err := addr.ValueForProtocol(ma.P_WS); err == nil {
+		return false
+	}
+	panic("not a WebSocket address")
+}
+
 func connectAndExchangeData(t *testing.T, laddr ma.Multiaddr, secure bool) {
 	var opts []Option
 	var tlsConf *tls.Config
@@ -339,6 +349,8 @@ func connectAndExchangeData(t *testing.T, laddr ma.Multiaddr, secure bool) {
 		require.NoError(t, err)
 		c, err := tpt.Dial(context.Background(), l.Multiaddr(), server)
 		require.NoError(t, err)
+		require.Equal(t, secure, isWSS(c.LocalMultiaddr()))
+		require.Equal(t, secure, isWSS(c.RemoteMultiaddr()))
 		str, err := c.OpenStream(context.Background())
 		require.NoError(t, err)
 		defer str.Close()
@@ -349,6 +361,8 @@ func connectAndExchangeData(t *testing.T, laddr ma.Multiaddr, secure bool) {
 	c, err := l.Accept()
 	require.NoError(t, err)
 	defer c.Close()
+	require.Equal(t, secure, isWSS(c.LocalMultiaddr()))
+	require.Equal(t, secure, isWSS(c.RemoteMultiaddr()))
 	str, err := c.AcceptStream()
 	require.NoError(t, err)
 	defer str.Close()
@@ -481,7 +495,7 @@ func TestWriteZero(t *testing.T) {
 		}
 		defer c.Close()
 
-		for i := 0; i < 5; i++ {
+		for i := 0; i < 100; i++ {
 			n, err := c.Write(msg)
 			if n != 0 {
 				t.Errorf("expected to write 0 bytes, wrote %d", n)
@@ -498,7 +512,7 @@ func TestWriteZero(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	buf := make([]byte, 1)
+	buf := make([]byte, 100)
 	n, err := c.Read(buf)
 	if n != 0 {
 		t.Errorf("read %d bytes, expected 0", n)
@@ -511,12 +525,13 @@ func TestWriteZero(t *testing.T) {
 func TestResolveMultiaddr(t *testing.T) {
 	// map[unresolved]resolved
 	testCases := map[string]string{
+		"/dns/example.com/tcp/1234/wss":        "/dns/example.com/tcp/1234/tls/sni/example.com/ws",
 		"/dns4/example.com/tcp/1234/wss":       "/dns4/example.com/tcp/1234/tls/sni/example.com/ws",
 		"/dns6/example.com/tcp/1234/wss":       "/dns6/example.com/tcp/1234/tls/sni/example.com/ws",
-		"/dnsaddr/example.com/tcp/1234/wss":    "/dnsaddr/example.com/tcp/1234/tls/sni/example.com/ws",
+		"/dnsaddr/example.com/tcp/1234/wss":    "/dnsaddr/example.com/tcp/1234/wss",
 		"/dns4/example.com/tcp/1234/tls/ws":    "/dns4/example.com/tcp/1234/tls/sni/example.com/ws",
 		"/dns6/example.com/tcp/1234/tls/ws":    "/dns6/example.com/tcp/1234/tls/sni/example.com/ws",
-		"/dnsaddr/example.com/tcp/1234/tls/ws": "/dnsaddr/example.com/tcp/1234/tls/sni/example.com/ws",
+		"/dnsaddr/example.com/tcp/1234/tls/ws": "/dnsaddr/example.com/tcp/1234/tls/ws",
 	}
 
 	for unresolved, expectedMA := range testCases {

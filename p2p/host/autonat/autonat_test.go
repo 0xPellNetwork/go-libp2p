@@ -15,7 +15,6 @@ import (
 
 	"github.com/libp2p/go-msgio/pbio"
 
-	ma "github.com/multiformats/go-multiaddr"
 	"github.com/stretchr/testify/require"
 )
 
@@ -38,6 +37,37 @@ func sayPrivateStreamHandler(t *testing.T) network.StreamHandler {
 		res := pb.Message{
 			Type:         pb.Message_DIAL_RESPONSE.Enum(),
 			DialResponse: newDialResponseError(pb.Message_E_DIAL_ERROR, "dial failed"),
+		}
+		w.WriteMsg(&res)
+	}
+}
+
+func makeAutoNATRefuseDialRequest(t *testing.T, done chan struct{}) host.Host {
+	h := bhost.NewBlankHost(swarmt.GenSwarm(t))
+	h.SetStreamHandler(AutoNATProto, sayRefusedStreamHandler(t, done))
+	return h
+}
+
+func sayRefusedStreamHandler(t *testing.T, done chan struct{}) network.StreamHandler {
+	return func(s network.Stream) {
+		defer s.Close()
+		r := pbio.NewDelimitedReader(s, network.MessageSizeMax)
+		if err := r.ReadMsg(&pb.Message{}); err != nil {
+			// ignore error if the test has completed
+			select {
+			case _, ok := <-done:
+				if !ok {
+					return
+				}
+			default:
+			}
+			t.Error(err)
+			return
+		}
+		w := pbio.NewDelimitedWriter(s)
+		res := pb.Message{
+			Type:         pb.Message_DIAL_RESPONSE.Enum(),
+			DialResponse: newDialResponseError(pb.Message_E_DIAL_REFUSED, "dial refused"),
 		}
 		w.WriteMsg(&res)
 	}
@@ -155,7 +185,7 @@ func TestAutoNATPublictoPrivate(t *testing.T) {
 	// subscribe to AutoNat events
 	s, err := hc.EventBus().Subscribe(&event.EvtLocalReachabilityChanged{})
 	if err != nil {
-		t.Fatalf("failed to subscribe to event EvtLocalRoutabilityPublic, err=%s", err)
+		t.Fatalf("failed to subscribe to event EvtLocalReachabilityChanged, err=%s", err)
 	}
 
 	if status := an.Status(); status != network.ReachabilityUnknown {
@@ -196,6 +226,38 @@ func TestAutoNATIncomingEvents(t *testing.T) {
 	}, 500*time.Millisecond, 10*time.Millisecond, "Expected probe due to identification of autonat service")
 }
 
+func TestAutoNATDialRefused(t *testing.T) {
+	hs := makeAutoNATServicePublic(t)
+	defer hs.Close()
+	hc, an := makeAutoNAT(t, hs)
+	defer hc.Close()
+	defer an.Close()
+
+	// subscribe to AutoNat events
+	s, err := hc.EventBus().Subscribe(&event.EvtLocalReachabilityChanged{})
+	if err != nil {
+		t.Fatalf("failed to subscribe to event EvtLocalReachabilityChanged, err=%s", err)
+	}
+
+	if status := an.Status(); status != network.ReachabilityUnknown {
+		t.Fatalf("unexpected NAT status: %d", status)
+	}
+
+	connect(t, hs, hc)
+	expectEvent(t, s, network.ReachabilityPublic, 10*time.Second)
+
+	done := make(chan struct{})
+	hs.SetStreamHandler(AutoNATProto, sayRefusedStreamHandler(t, done))
+	hps := makeAutoNATRefuseDialRequest(t, done)
+	connect(t, hps, hc)
+	identifyAsServer(hps, hc)
+
+	require.Never(t, func() bool {
+		return an.Status() != network.ReachabilityPublic
+	}, 3*time.Second, 1*time.Second, "Expected probe to not change reachability from public")
+	close(done)
+}
+
 func TestAutoNATObservationRecording(t *testing.T) {
 	hs := makeAutoNATServicePublic(t)
 	defer hs.Close()
@@ -209,21 +271,7 @@ func TestAutoNATObservationRecording(t *testing.T) {
 		t.Fatalf("failed to subscribe to event EvtLocalRoutabilityPublic, err=%s", err)
 	}
 
-	// pubic observation without address should be ignored.
-	an.recordObservation(autoNATResult{network.ReachabilityPublic, nil})
-	if an.Status() != network.ReachabilityUnknown {
-		t.Fatalf("unexpected transition")
-	}
-
-	select {
-	case <-s.Out():
-		t.Fatal("not expecting a public reachability event")
-	default:
-		// expected
-	}
-
-	addr, _ := ma.NewMultiaddr("/ip4/127.0.0.1/udp/1234")
-	an.recordObservation(autoNATResult{network.ReachabilityPublic, addr})
+	an.recordObservation(network.ReachabilityPublic)
 	if an.Status() != network.ReachabilityPublic {
 		t.Fatalf("failed to transition to public.")
 	}
@@ -231,7 +279,7 @@ func TestAutoNATObservationRecording(t *testing.T) {
 	expectEvent(t, s, network.ReachabilityPublic, 3*time.Second)
 
 	// a single recording should have confidence still at 0, and transition to private quickly.
-	an.recordObservation(autoNATResult{network.ReachabilityPrivate, nil})
+	an.recordObservation(network.ReachabilityPrivate)
 	if an.Status() != network.ReachabilityPrivate {
 		t.Fatalf("failed to transition to private.")
 	}
@@ -239,19 +287,28 @@ func TestAutoNATObservationRecording(t *testing.T) {
 	expectEvent(t, s, network.ReachabilityPrivate, 3*time.Second)
 
 	// stronger public confidence should be harder to undo.
-	an.recordObservation(autoNATResult{network.ReachabilityPublic, addr})
-	an.recordObservation(autoNATResult{network.ReachabilityPublic, addr})
+	an.recordObservation(network.ReachabilityPublic)
+	an.recordObservation(network.ReachabilityPublic)
 	if an.Status() != network.ReachabilityPublic {
 		t.Fatalf("failed to transition to public.")
 	}
-
 	expectEvent(t, s, network.ReachabilityPublic, 3*time.Second)
 
-	an.recordObservation(autoNATResult{network.ReachabilityPrivate, nil})
+	an.recordObservation(network.ReachabilityPrivate)
 	if an.Status() != network.ReachabilityPublic {
 		t.Fatalf("too-extreme private transition.")
 	}
 
+	// Don't emit events if reachability hasn't changed
+	an.recordObservation(network.ReachabilityPublic)
+	if an.Status() != network.ReachabilityPublic {
+		t.Fatalf("reachability should stay public")
+	}
+	select {
+	case <-s.Out():
+		t.Fatal("received event without state transition")
+	case <-time.After(300 * time.Millisecond):
+	}
 }
 
 func TestStaticNat(t *testing.T) {

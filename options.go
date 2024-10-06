@@ -23,9 +23,12 @@ import (
 	"github.com/libp2p/go-libp2p/core/transport"
 	"github.com/libp2p/go-libp2p/p2p/host/autorelay"
 	bhost "github.com/libp2p/go-libp2p/p2p/host/basic"
+	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 	tptu "github.com/libp2p/go-libp2p/p2p/net/upgrader"
 	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/libp2p/go-libp2p/p2p/protocol/holepunch"
+	"github.com/libp2p/go-libp2p/p2p/transport/quicreuse"
+	"github.com/prometheus/client_golang/prometheus"
 
 	ma "github.com/multiformats/go-multiaddr"
 	madns "github.com/multiformats/go-multiaddr-dns"
@@ -93,6 +96,33 @@ var NoSecurity Option = func(cfg *Config) error {
 func Muxer(name string, muxer network.Multiplexer) Option {
 	return func(cfg *Config) error {
 		cfg.Muxers = append(cfg.Muxers, tptu.StreamMuxer{Muxer: muxer, ID: protocol.ID(name)})
+		return nil
+	}
+}
+
+func QUICReuse(constructor interface{}, opts ...quicreuse.Option) Option {
+	return func(cfg *Config) error {
+		tag := `group:"quicreuseopts"`
+		typ := reflect.ValueOf(constructor).Type()
+		numParams := typ.NumIn()
+		isVariadic := typ.IsVariadic()
+
+		if !isVariadic && len(opts) > 0 {
+			return errors.New("QUICReuse constructor doesn't take any options")
+		}
+
+		var params []string
+		if isVariadic && len(opts) > 0 {
+			// If there are options, apply the tag.
+			// Since options are variadic, they have to be the last argument of the constructor.
+			params = make([]string, numParams)
+			params[len(params)-1] = tag
+		}
+
+		cfg.QUICReuse = append(cfg.QUICReuse, fx.Provide(fx.Annotate(constructor, fx.ParamTags(params...))))
+		for _, opt := range opts {
+			cfg.QUICReuse = append(cfg.QUICReuse, fx.Supply(fx.Annotate(opt, fx.ResultTags(tag))))
+		}
 		return nil
 	}
 }
@@ -319,7 +349,7 @@ func EnableAutoRelayWithPeerSource(peerSource autorelay.PeerSource, opts ...auto
 // forcing the local node to believe it is reachable externally.
 func ForceReachabilityPublic() Option {
 	return func(cfg *Config) error {
-		public := network.Reachability(network.ReachabilityPublic)
+		public := network.ReachabilityPublic
 		cfg.AutoNATConfig.ForceReachability = &public
 		return nil
 	}
@@ -329,7 +359,7 @@ func ForceReachabilityPublic() Option {
 // forceing the local node to believe it is behind a NAT and not reachable externally.
 func ForceReachabilityPrivate() Option {
 	return func(cfg *Config) error {
-		private := network.Reachability(network.ReachabilityPrivate)
+		private := network.ReachabilityPrivate
 		cfg.AutoNATConfig.ForceReachability = &private
 		return nil
 	}
@@ -517,6 +547,91 @@ func WithDialTimeout(t time.Duration) Option {
 			return errors.New("dial timeout needs to be non-negative")
 		}
 		cfg.DialTimeout = t
+		return nil
+	}
+}
+
+// DisableMetrics configures libp2p to disable prometheus metrics
+func DisableMetrics() Option {
+	return func(cfg *Config) error {
+		cfg.DisableMetrics = true
+		return nil
+	}
+}
+
+// PrometheusRegisterer configures libp2p to use reg as the Registerer for all metrics subsystems
+func PrometheusRegisterer(reg prometheus.Registerer) Option {
+	return func(cfg *Config) error {
+		if cfg.DisableMetrics {
+			return errors.New("cannot set registerer when metrics are disabled")
+		}
+		if cfg.PrometheusRegisterer != nil {
+			return errors.New("registerer already set")
+		}
+		if reg == nil {
+			return errors.New("registerer cannot be nil")
+		}
+		cfg.PrometheusRegisterer = reg
+		return nil
+	}
+}
+
+// DialRanker configures libp2p to use d as the dial ranker. To enable smart
+// dialing use `swarm.DefaultDialRanker`. use `swarm.NoDelayDialRanker` to
+// disable smart dialing.
+//
+// Deprecated: use SwarmOpts(swarm.WithDialRanker(d)) instead
+func DialRanker(d network.DialRanker) Option {
+	return func(cfg *Config) error {
+		if cfg.DialRanker != nil {
+			return errors.New("dial ranker already configured")
+		}
+		cfg.DialRanker = d
+		return nil
+	}
+}
+
+// SwarmOpts configures libp2p to use swarm with opts
+func SwarmOpts(opts ...swarm.Option) Option {
+	return func(cfg *Config) error {
+		cfg.SwarmOpts = opts
+		return nil
+	}
+}
+
+// DisableIdentifyAddressDiscovery disables address discovery using peer provided observed addresses
+// in identify. If you know your public addresses upfront, the recommended way is to use
+// AddressFactory to provide the external adddress to the host and use this option to disable
+// discovery from identify.
+func DisableIdentifyAddressDiscovery() Option {
+	return func(cfg *Config) error {
+		cfg.DisableIdentifyAddressDiscovery = true
+		return nil
+	}
+}
+
+// EnableAutoNATv2 enables autonat v2
+func EnableAutoNATv2() Option {
+	return func(cfg *Config) error {
+		cfg.EnableAutoNATv2 = true
+		return nil
+	}
+}
+
+// UDPBlackHoleSuccessCounter configures libp2p to use f as the black hole filter for UDP addrs
+func UDPBlackHoleSuccessCounter(f *swarm.BlackHoleSuccessCounter) Option {
+	return func(cfg *Config) error {
+		cfg.UDPBlackHoleSuccessCounter = f
+		cfg.CustomUDPBlackHoleSuccessCounter = true
+		return nil
+	}
+}
+
+// IPv6BlackHoleSuccessCounter configures libp2p to use f as the black hole filter for IPv6 addrs
+func IPv6BlackHoleSuccessCounter(f *swarm.BlackHoleSuccessCounter) Option {
+	return func(cfg *Config) error {
+		cfg.IPv6BlackHoleSuccessCounter = f
+		cfg.CustomIPv6BlackHoleSuccessCounter = true
 		return nil
 	}
 }

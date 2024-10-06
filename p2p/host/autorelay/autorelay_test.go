@@ -2,27 +2,39 @@ package autorelay_test
 
 import (
 	"context"
-	"os"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/libp2p/go-libp2p"
-	"github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/test"
 	"github.com/libp2p/go-libp2p/p2p/host/autorelay"
-	relayv1 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv1/relay"
 	circuitv2_proto "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/proto"
 
-	"github.com/benbjohnson/clock"
 	ma "github.com/multiformats/go-multiaddr"
 	"github.com/stretchr/testify/require"
 )
 
 const protoIDv2 = circuitv2_proto.ProtoIDv2Hop
+
+type mockClock struct {
+	*test.MockClock
+}
+
+func (c mockClock) InstantTimer(when time.Time) autorelay.InstantTimer {
+	return c.MockClock.InstantTimer(when)
+}
+
+func newMockClock() mockClock {
+	return mockClock{MockClock: test.NewMockClock()}
+}
+
+var _ autorelay.ClockWithInstantTimer = mockClock{}
 
 func numRelays(h host.Host) int {
 	return len(usedRelays(h))
@@ -98,30 +110,7 @@ func newRelay(t *testing.T) host.Host {
 			}
 		}
 		return false
-	}, 500*time.Millisecond, 10*time.Millisecond)
-	return h
-}
-
-func newRelayV1(t *testing.T) host.Host {
-	t.Helper()
-	h, err := libp2p.New(
-		libp2p.DisableRelay(),
-		libp2p.ForceReachabilityPublic(),
-		libp2p.AddrsFactory(func(addrs []ma.Multiaddr) []ma.Multiaddr {
-			for i, addr := range addrs {
-				saddr := addr.String()
-				if strings.HasPrefix(saddr, "/ip4/127.0.0.1/") {
-					addrNoIP := strings.TrimPrefix(saddr, "/ip4/127.0.0.1")
-					addrs[i] = ma.StringCast("/dns4/localhost" + addrNoIP)
-				}
-			}
-			return addrs
-		}),
-	)
-	require.NoError(t, err)
-	r, err := relayv1.NewRelay(h)
-	require.NoError(t, err)
-	t.Cleanup(func() { r.Close() })
+	}, time.Second, 10*time.Millisecond)
 	return h
 }
 
@@ -145,7 +134,7 @@ func TestSingleCandidate(t *testing.T) {
 	)
 	defer h.Close()
 
-	require.Eventually(t, func() bool { return numRelays(h) > 0 }, 3*time.Second, 100*time.Millisecond)
+	require.Eventually(t, func() bool { return numRelays(h) > 0 }, 10*time.Second, 100*time.Millisecond)
 	// test that we don't add any more relays
 	require.Never(t, func() bool { return numRelays(h) > 1 }, 200*time.Millisecond, 50*time.Millisecond)
 	require.Equal(t, 1, counter, "expected the peer source callback to only have been called once")
@@ -180,32 +169,6 @@ func TestSingleRelay(t *testing.T) {
 	// test that we don't add any more relays
 	require.Never(t, func() bool { return numRelays(h) > 1 }, 200*time.Millisecond, 50*time.Millisecond)
 }
-func TestPreferRelayV2(t *testing.T) {
-	r := newRelay(t)
-	defer r.Close()
-	// The relay supports both v1 and v2. The v1 stream handler should never be called,
-	// if we prefer v2 relays.
-	r.SetStreamHandler(relayv1.ProtoID, func(str network.Stream) {
-		str.Reset()
-		t.Fatal("used relay v1")
-	})
-
-	h := newPrivateNode(t,
-		func(context.Context, int) <-chan peer.AddrInfo {
-			peerChan := make(chan peer.AddrInfo, 1)
-			defer close(peerChan)
-			peerChan <- peer.AddrInfo{ID: r.ID(), Addrs: r.Addrs()}
-			return peerChan
-		},
-		autorelay.WithMaxCandidates(1),
-		autorelay.WithNumRelays(99999),
-		autorelay.WithBootDelay(0),
-		autorelay.WithMinInterval(time.Hour),
-	)
-	defer h.Close()
-
-	require.Eventually(t, func() bool { return numRelays(h) > 0 }, 3*time.Second, 100*time.Millisecond)
-}
 
 func TestWaitForCandidates(t *testing.T) {
 	peerChan := make(chan peer.AddrInfo)
@@ -229,12 +192,12 @@ func TestWaitForCandidates(t *testing.T) {
 	r2 := newRelay(t)
 	t.Cleanup(func() { r2.Close() })
 	peerChan <- peer.AddrInfo{ID: r2.ID(), Addrs: r2.Addrs()}
-	require.Eventually(t, func() bool { return numRelays(h) > 0 }, 3*time.Second, 100*time.Millisecond)
+	require.Eventually(t, func() bool { return numRelays(h) > 0 }, 10*time.Second, 100*time.Millisecond)
 }
 
 func TestBackoff(t *testing.T) {
 	const backoff = 20 * time.Second
-	cl := clock.NewMock()
+	cl := newMockClock()
 	r, err := libp2p.New(
 		libp2p.DisableRelay(),
 		libp2p.ForceReachabilityPublic(),
@@ -251,17 +214,17 @@ func TestBackoff(t *testing.T) {
 	)
 	require.NoError(t, err)
 	defer r.Close()
-	var reservations int32
+	var reservations atomic.Int32
 	r.SetStreamHandler(protoIDv2, func(str network.Stream) {
-		atomic.AddInt32(&reservations, 1)
-		str.Reset()
+		defer reservations.Add(1)
+		str.Close()
 	})
 
-	var counter int32 // to be used atomically
+	var counter atomic.Int32
 	h := newPrivateNode(t,
 		func(context.Context, int) <-chan peer.AddrInfo {
 			// always return the same node, and make sure we don't try to connect to it too frequently
-			atomic.AddInt32(&counter, 1)
+			counter.Add(1)
 			peerChan := make(chan peer.AddrInfo, 1)
 			peerChan <- peer.AddrInfo{ID: r.ID(), Addrs: r.Addrs()}
 			close(peerChan)
@@ -270,21 +233,37 @@ func TestBackoff(t *testing.T) {
 		autorelay.WithNumRelays(1),
 		autorelay.WithBootDelay(0),
 		autorelay.WithBackoff(backoff),
+		autorelay.WithMinCandidates(1),
+		autorelay.WithMaxCandidateAge(1),
 		autorelay.WithClock(cl),
-		autorelay.WithMinInterval(time.Second),
+		autorelay.WithMinInterval(0),
 	)
 	defer h.Close()
 
-	require.Eventually(t, func() bool { return atomic.LoadInt32(&reservations) == 1 }, 3*time.Second, 20*time.Millisecond)
+	require.Eventually(t, func() bool {
+		return reservations.Load() == 1
+	}, 3*time.Second, 20*time.Millisecond, "reservations load should be 1")
+	// We need to wait
+
+	cl.AdvanceBy(1) // Increment the time a little so we can make another peer source call
+	require.Eventually(t, func() bool {
+		// The reservation will fail, and autorelay will ask the peer source for
+		// more candidates.  Wait until it does so, this way we know that client
+		// knows the relay connection has failed before we advance the time.
+		return counter.Load() > 1
+	}, 2*time.Second, 100*time.Millisecond, "counter load should be 2")
+
 	// make sure we don't add any relays yet
 	for i := 0; i < 2; i++ {
-		cl.Add(backoff / 3)
-		require.Equal(t, 1, int(atomic.LoadInt32(&reservations)))
+		cl.AdvanceBy(backoff / 3)
+		require.Equal(t, 1, int(reservations.Load()))
 	}
-	cl.Add(backoff / 2)
-	require.Eventually(t, func() bool { return atomic.LoadInt32(&reservations) == 2 }, 3*time.Second, 20*time.Millisecond)
-	require.Less(t, int(atomic.LoadInt32(&counter)), 100) // just make sure we're not busy-looping
-	require.Equal(t, 2, int(atomic.LoadInt32(&reservations)))
+	cl.AdvanceBy(backoff)
+	require.Eventually(t, func() bool {
+		return reservations.Load() == 2
+	}, 3*time.Second, 100*time.Millisecond, "reservations load should be 2")
+	require.Less(t, int(counter.Load()), 10) // just make sure we're not busy-looping
+	require.Equal(t, 2, int(reservations.Load()))
 }
 
 func TestStaticRelays(t *testing.T) {
@@ -302,47 +281,7 @@ func TestStaticRelays(t *testing.T) {
 	)
 	defer h.Close()
 
-	require.Eventually(t, func() bool { return numRelays(h) > 0 }, 2*time.Second, 50*time.Millisecond)
-}
-
-func TestRelayV1(t *testing.T) {
-	t.Run("relay v1 support disabled", func(t *testing.T) {
-		peerChan := make(chan peer.AddrInfo, 1)
-		r := newRelayV1(t)
-		t.Cleanup(func() { r.Close() })
-		peerChan <- peer.AddrInfo{ID: r.ID(), Addrs: r.Addrs()}
-		close(peerChan)
-
-		h := newPrivateNode(t,
-			func(context.Context, int) <-chan peer.AddrInfo { return peerChan },
-			autorelay.WithBootDelay(0),
-			autorelay.WithMinInterval(time.Hour),
-		)
-		defer h.Close()
-
-		require.Never(t, func() bool { return numRelays(h) > 0 }, 250*time.Millisecond, 100*time.Millisecond)
-	})
-
-	t.Run("relay v1 support enabled", func(t *testing.T) {
-		peerChan := make(chan peer.AddrInfo, 1)
-		r := newRelayV1(t)
-		t.Cleanup(func() { r.Close() })
-		peerChan <- peer.AddrInfo{ID: r.ID(), Addrs: r.Addrs()}
-		close(peerChan)
-
-		h := newPrivateNode(t,
-			func(context.Context, int) <-chan peer.AddrInfo { return peerChan },
-			autorelay.WithBootDelay(0),
-			autorelay.WithCircuitV1Support(),
-			autorelay.WithMinInterval(time.Hour),
-		)
-		defer h.Close()
-
-		addrUpdated, err := h.EventBus().Subscribe(new(event.EvtLocalAddressesUpdated))
-		require.NoError(t, err)
-
-		expectDeltaInAddrUpdated(t, addrUpdated, 1)
-	})
+	require.Eventually(t, func() bool { return numRelays(h) > 0 }, 10*time.Second, 50*time.Millisecond)
 }
 
 func TestConnectOnDisconnect(t *testing.T) {
@@ -365,7 +304,7 @@ func TestConnectOnDisconnect(t *testing.T) {
 	)
 	defer h.Close()
 
-	require.Eventually(t, func() bool { return numRelays(h) > 0 }, 3*time.Second, 100*time.Millisecond)
+	require.Eventually(t, func() bool { return numRelays(h) > 0 }, 10*time.Second, 100*time.Millisecond)
 	relaysInUse := usedRelays(h)
 	require.Len(t, relaysInUse, 1)
 	oldRelay := relaysInUse[0]
@@ -376,14 +315,14 @@ func TestConnectOnDisconnect(t *testing.T) {
 		}
 	}
 
-	require.Eventually(t, func() bool { return numRelays(h) > 0 }, 3*time.Second, 100*time.Millisecond)
+	require.Eventually(t, func() bool { return numRelays(h) > 0 }, 10*time.Second, 100*time.Millisecond)
 	relaysInUse = usedRelays(h)
 	require.Len(t, relaysInUse, 1)
 	require.NotEqualf(t, oldRelay, relaysInUse[0], "old relay should not be used again")
 }
 
 func TestMaxAge(t *testing.T) {
-	cl := clock.NewMock()
+	cl := newMockClock()
 
 	const num = 4
 	peerChan1 := make(chan peer.AddrInfo, num)
@@ -418,32 +357,34 @@ func TestMaxAge(t *testing.T) {
 		autorelay.WithBootDelay(0),
 		autorelay.WithMaxCandidateAge(20*time.Minute),
 		autorelay.WithClock(cl),
-		autorelay.WithMinInterval(time.Second),
+		autorelay.WithMinInterval(30*time.Second),
 	)
 	defer h.Close()
 
-	require.Eventually(t, func() bool { return numRelays(h) > 0 }, 3*time.Second, 100*time.Millisecond)
+	require.Eventually(t, func() bool {
+		return numRelays(h) > 0
+	}, 10*time.Second, 100*time.Millisecond)
 	relays := usedRelays(h)
 	require.Len(t, relays, 1)
 
-	waitFor := 500 * time.Millisecond
-	tick := 100 * time.Millisecond
-	if os.Getenv("CI") != "" {
-		// Only increase the waitFor since we are increasing the mock clock every tick.
-		waitFor *= 10
-	}
+	cl.AdvanceBy(time.Minute)
 	require.Eventually(t, func() bool {
-		// we don't know exactly when the timer is reset, just advance our timer multiple times if necessary
-		cl.Add(time.Second)
 		return len(peerChans) == 0
-	}, waitFor, tick)
+	}, 10*time.Second, 100*time.Millisecond)
 
-	cl.Add(10 * time.Minute)
+	cl.AdvanceBy(10 * time.Minute)
 	for _, r := range relays2 {
 		peerChan2 <- peer.AddrInfo{ID: r.ID(), Addrs: r.Addrs()}
 	}
-	cl.Add(11 * time.Minute)
+	cl.AdvanceBy(11 * time.Minute)
+
+	require.Eventually(t, func() bool {
+		relays = usedRelays(h)
+		return len(relays) == 1
+	}, 10*time.Second, 100*time.Millisecond)
+
 	// by now the 3 relays should have been garbage collected
+	// And we should only be using a single relay. Lets close it.
 	var oldRelay peer.ID
 	for _, r := range relays1 {
 		if r.ID() == relays[0] {
@@ -459,52 +400,28 @@ func TestMaxAge(t *testing.T) {
 			return false
 		}
 		return relays[0] != oldRelay
-	}, 3*time.Second, 100*time.Millisecond)
+	}, 10*time.Second, 100*time.Millisecond)
 
 	require.Len(t, relays, 1)
 	ids := make([]peer.ID, 0, len(relays2))
 	for _, r := range relays2 {
 		ids = append(ids, r.ID())
 	}
+
+	require.Eventually(t, func() bool {
+		for _, id := range ids {
+			if id == relays[0] {
+				return true
+			}
+		}
+		fmt.Println("waiting for", ids, "to contain", relays[0])
+		return false
+	}, 3*time.Second, 100*time.Millisecond)
 	require.Contains(t, ids, relays[0])
 }
 
-func expectDeltaInAddrUpdated(t *testing.T, addrUpdated event.Subscription, expectedDelta int) {
-	t.Helper()
-	delta := 0
-	for {
-		select {
-		case evAny := <-addrUpdated.Out():
-			ev := evAny.(event.EvtLocalAddressesUpdated)
-			for _, updatedAddr := range ev.Removed {
-				if updatedAddr.Action == event.Removed {
-					if _, err := updatedAddr.Address.ValueForProtocol(ma.P_CIRCUIT); err == nil {
-						delta--
-						if delta == expectedDelta {
-							return
-						}
-					}
-				}
-			}
-			for _, updatedAddr := range ev.Current {
-				if updatedAddr.Action == event.Added {
-					if _, err := updatedAddr.Address.ValueForProtocol(ma.P_CIRCUIT); err == nil {
-						delta++
-						if delta == expectedDelta {
-							return
-						}
-					}
-				}
-			}
-		case <-time.After(10 * time.Second):
-			t.Fatal("timeout waiting for address updated event")
-		}
-	}
-
-}
-
 func TestReconnectToStaticRelays(t *testing.T) {
-	cl := clock.NewMock()
+	cl := newMockClock()
 	var staticRelays []peer.AddrInfo
 	const numStaticRelays = 1
 	relays := make([]host.Host, 0, numStaticRelays)
@@ -518,16 +435,14 @@ func TestReconnectToStaticRelays(t *testing.T) {
 	h := newPrivateNodeWithStaticRelays(t,
 		staticRelays,
 		autorelay.WithClock(cl),
+		autorelay.WithBackoff(30*time.Minute),
 	)
-
 	defer h.Close()
 
-	addrUpdated, err := h.EventBus().Subscribe(new(event.EvtLocalAddressesUpdated))
-	require.NoError(t, err)
-
-	expectDeltaInAddrUpdated(t, addrUpdated, 1)
-
-	cl.Add(time.Minute)
+	cl.AdvanceBy(time.Minute)
+	require.Eventually(t, func() bool {
+		return numRelays(h) == 1
+	}, 10*time.Second, 100*time.Millisecond)
 
 	relaysInUse := usedRelays(h)
 	oldRelay := relaysInUse[0]
@@ -536,12 +451,18 @@ func TestReconnectToStaticRelays(t *testing.T) {
 			r.Network().ClosePeer(h.ID())
 		}
 	}
+	require.Eventually(t, func() bool {
+		return numRelays(h) == 0
+	}, 10*time.Second, 100*time.Millisecond)
 
-	cl.Add(time.Hour)
-	expectDeltaInAddrUpdated(t, addrUpdated, -1)
+	cl.AdvanceBy(time.Hour)
+	require.Eventually(t, func() bool {
+		return numRelays(h) == 1
+	}, 10*time.Second, 100*time.Millisecond)
 }
 
 func TestMinInterval(t *testing.T) {
+	cl := newMockClock()
 	h := newPrivateNode(t,
 		func(context.Context, int) <-chan peer.AddrInfo {
 			peerChan := make(chan peer.AddrInfo, 1)
@@ -551,6 +472,7 @@ func TestMinInterval(t *testing.T) {
 			peerChan <- peer.AddrInfo{ID: r1.ID(), Addrs: r1.Addrs()}
 			return peerChan
 		},
+		autorelay.WithClock(cl),
 		autorelay.WithMinCandidates(2),
 		autorelay.WithNumRelays(1),
 		autorelay.WithBootDelay(time.Hour),
@@ -558,7 +480,40 @@ func TestMinInterval(t *testing.T) {
 	)
 	defer h.Close()
 
+	cl.AdvanceBy(400 * time.Millisecond)
 	// The second call to peerSource should happen after 1 second
 	require.Never(t, func() bool { return numRelays(h) > 0 }, 500*time.Millisecond, 100*time.Millisecond)
-	require.Eventually(t, func() bool { return numRelays(h) > 0 }, 1*time.Second, 100*time.Millisecond)
+	cl.AdvanceBy(600 * time.Millisecond)
+	require.Eventually(t, func() bool { return numRelays(h) > 0 }, 3*time.Second, 100*time.Millisecond)
+}
+
+func TestNoBusyLoop0MinInterval(t *testing.T) {
+	var calledTimes uint64
+	cl := newMockClock()
+	h := newPrivateNode(t,
+		func(context.Context, int) <-chan peer.AddrInfo {
+			atomic.AddUint64(&calledTimes, 1)
+			peerChan := make(chan peer.AddrInfo, 1)
+			defer close(peerChan)
+			r1 := newRelay(t)
+			t.Cleanup(func() { r1.Close() })
+			peerChan <- peer.AddrInfo{ID: r1.ID(), Addrs: r1.Addrs()}
+			return peerChan
+		},
+		autorelay.WithClock(cl),
+		autorelay.WithMinCandidates(1),
+		autorelay.WithMaxCandidates(1),
+		autorelay.WithNumRelays(0),
+		autorelay.WithBootDelay(time.Hour),
+		autorelay.WithMinInterval(time.Millisecond),
+	)
+	defer h.Close()
+
+	require.Never(t, func() bool {
+		cl.AdvanceBy(time.Second)
+		val := atomic.LoadUint64(&calledTimes)
+		return val >= 2
+	}, 500*time.Millisecond, 100*time.Millisecond)
+	val := atomic.LoadUint64(&calledTimes)
+	require.Less(t, val, uint64(2))
 }

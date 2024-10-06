@@ -7,21 +7,19 @@ import (
 	"testing"
 	"time"
 
-	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
-
-	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/proto"
-
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p-testing/race"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/peerstore"
-	"github.com/libp2p/go-libp2p/p2p/host/autorelay"
-	relayv1 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv1/relay"
+	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/proto"
+	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/libp2p/go-libp2p/p2p/protocol/holepunch"
 	holepunch_pb "github.com/libp2p/go-libp2p/p2p/protocol/holepunch/pb"
 	"github.com/libp2p/go-libp2p/p2p/protocol/identify"
+	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
+
 	"github.com/libp2p/go-msgio/pbio"
 	ma "github.com/multiformats/go-multiaddr"
 	manet "github.com/multiformats/go-multiaddr/net"
@@ -98,12 +96,16 @@ func TestNoHolePunchIfDirectConnExists(t *testing.T) {
 	require.GreaterOrEqual(t, nc2, 1)
 
 	require.NoError(t, hps.DirectConnect(h2.ID()))
-	require.Equal(t, len(h1.Network().ConnsToPeer(h2.ID())), nc1)
-	require.Equal(t, len(h2.Network().ConnsToPeer(h1.ID())), nc2)
+	require.Len(t, h1.Network().ConnsToPeer(h2.ID()), nc1)
+	require.Len(t, h2.Network().ConnsToPeer(h1.ID()), nc2)
 	require.Empty(t, tr.getEvents())
 }
 
 func TestDirectDialWorks(t *testing.T) {
+	if race.WithRace() {
+		t.Skip("modifying manet.Private4 is racy")
+	}
+
 	// mark all addresses as public
 	cpy := manet.Private4
 	manet.Private4 = []*net.IPNet{}
@@ -118,13 +120,13 @@ func TestDirectDialWorks(t *testing.T) {
 	h1.Peerstore().AddAddrs(h2.ID(), h2.Addrs(), peerstore.ConnectedAddrTTL)
 
 	// try to hole punch without any connection and streams, if it works -> it's a direct connection
-	require.Len(t, h1.Network().ConnsToPeer(h2.ID()), 0)
+	require.Empty(t, h1.Network().ConnsToPeer(h2.ID()))
 	require.NoError(t, h1ps.DirectConnect(h2.ID()))
 	require.GreaterOrEqual(t, len(h1.Network().ConnsToPeer(h2.ID())), 1)
 	require.GreaterOrEqual(t, len(h2.Network().ConnsToPeer(h1.ID())), 1)
 	events := tr.getEvents()
 	require.Len(t, events, 1)
-	require.Equal(t, events[0].Type, holepunch.DirectDialEvtT)
+	require.Equal(t, holepunch.DirectDialEvtT, events[0].Type)
 }
 
 func TestEndToEndSimConnect(t *testing.T) {
@@ -245,7 +247,6 @@ func TestFailuresOnInitiator(t *testing.T) {
 				require.Contains(t, err.Error(), tc.errMsg)
 			}
 		})
-
 	}
 }
 
@@ -338,7 +339,7 @@ func TestFailuresOnResponder(t *testing.T) {
 			defer h2.Close()
 			defer relay.Close()
 
-			s, err := h2.NewStream(context.Background(), h1.ID(), holepunch.Protocol)
+			s, err := h2.NewStream(network.WithAllowLimitedConn(context.Background(), "holepunch"), h1.ID(), holepunch.Protocol)
 			require.NoError(t, err)
 
 			go tc.initiator(s)
@@ -359,7 +360,6 @@ func TestFailuresOnResponder(t *testing.T) {
 			require.Len(t, errs, 1)
 			require.Contains(t, errs[0], tc.errMsg)
 		})
-
 	}
 }
 
@@ -423,10 +423,7 @@ func mkHostWithStaticAutoRelay(t *testing.T, relay host.Host) host.Host {
 	h, err := libp2p.New(
 		libp2p.ListenAddrs(ma.StringCast("/ip4/127.0.0.1/tcp/0")),
 		libp2p.EnableRelay(),
-		libp2p.EnableAutoRelayWithStaticRelays(
-			[]peer.AddrInfo{pi},
-			autorelay.WithCircuitV1Support(),
-		),
+		libp2p.EnableAutoRelayWithStaticRelays([]peer.AddrInfo{pi}),
 		libp2p.ForceReachabilityPrivate(),
 		libp2p.ResourceManager(&network.NullResourceManager{}),
 	)
@@ -454,7 +451,7 @@ func makeRelayedHosts(t *testing.T, h1opt, h2opt []holepunch.Option, addHolePunc
 		libp2p.ResourceManager(&network.NullResourceManager{}),
 	)
 	require.NoError(t, err)
-	_, err = relayv1.NewRelay(relay)
+	_, err = relayv2.New(relay)
 	require.NoError(t, err)
 
 	// make sure the relay service is started and advertised by Identify
@@ -467,7 +464,7 @@ func makeRelayedHosts(t *testing.T, h1opt, h2opt []holepunch.Option, addHolePunc
 	defer h.Close()
 	require.NoError(t, h.Connect(context.Background(), peer.AddrInfo{ID: relay.ID(), Addrs: relay.Addrs()}))
 	require.Eventually(t, func() bool {
-		supported, err := h.Peerstore().SupportsProtocols(relay.ID(), proto.ProtoIDv2Hop, relayv1.ProtoID)
+		supported, err := h.Peerstore().SupportsProtocols(relay.ID(), proto.ProtoIDv2Hop)
 		return err == nil && len(supported) > 0
 	}, 3*time.Second, 100*time.Millisecond)
 

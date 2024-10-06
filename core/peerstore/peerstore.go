@@ -23,14 +23,15 @@ var (
 	// AddressTTL is the expiration time of addresses.
 	AddressTTL = time.Hour
 
-	// TempAddrTTL is the ttl used for a short lived address.
+	// TempAddrTTL is the ttl used for a short-lived address.
 	TempAddrTTL = time.Minute * 2
 
 	// RecentlyConnectedAddrTTL is used when we recently connected to a peer.
 	// It means that we are reasonably certain of the peer's address.
-	RecentlyConnectedAddrTTL = time.Minute * 30
+	RecentlyConnectedAddrTTL = time.Minute * 15
 
 	// OwnObservedAddrTTL is used for our own external addresses observed by peers.
+	// Deprecated: observed addresses are maintained till we disconnect from the peer which provided it
 	OwnObservedAddrTTL = time.Minute * 30
 )
 
@@ -46,7 +47,7 @@ const (
 	ConnectedAddrTTL
 )
 
-// Peerstore provides a threadsafe store of Peer related
+// Peerstore provides a thread-safe store of Peer related
 // information.
 type Peerstore interface {
 	io.Closer
@@ -62,7 +63,7 @@ type Peerstore interface {
 	// that peer, useful to other services.
 	PeerInfo(peer.ID) peer.AddrInfo
 
-	// Peers returns all of the peer IDs stored across all inner stores.
+	// Peers returns all the peer IDs stored across all inner stores.
 	Peers() peer.IDSlice
 }
 
@@ -116,7 +117,7 @@ type AddrBook interface {
 	// ClearAddresses removes all previously stored addresses.
 	ClearAddrs(p peer.ID)
 
-	// PeersWithAddrs returns all of the peer IDs stored in the AddrBook.
+	// PeersWithAddrs returns all the peer IDs stored in the AddrBook.
 	PeersWithAddrs() peer.IDSlice
 }
 
@@ -174,7 +175,7 @@ type CertifiedAddrBook interface {
 	// added via ConsumePeerRecord.
 	ConsumePeerRecord(s *record.Envelope, ttl time.Duration) (accepted bool, err error)
 
-	// GetPeerRecord returns a Envelope containing a PeerRecord for the
+	// GetPeerRecord returns an Envelope containing a PeerRecord for the
 	// given peer id, if one exists.
 	// Returns nil if no signed PeerRecord exists for the peer.
 	GetPeerRecord(p peer.ID) *record.Envelope

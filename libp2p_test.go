@@ -2,19 +2,31 @@ package libp2p
 
 import (
 	"context"
+	"crypto/rand"
+	"errors"
 	"fmt"
 	"regexp"
-	"strings"
 	"testing"
+	"time"
 
 	"github.com/libp2p/go-libp2p/core/connmgr"
 	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/peerstore"
+	"github.com/libp2p/go-libp2p/core/routing"
 	"github.com/libp2p/go-libp2p/core/transport"
+	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
+	"github.com/libp2p/go-libp2p/p2p/net/swarm"
+	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	tls "github.com/libp2p/go-libp2p/p2p/security/tls"
+	quic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
+	webtransport "github.com/libp2p/go-libp2p/p2p/transport/webtransport"
+	"go.uber.org/goleak"
 
 	ma "github.com/multiformats/go-multiaddr"
 	"github.com/stretchr/testify/require"
@@ -26,17 +38,6 @@ func TestNewHost(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.Close()
-}
-
-func TestBadTransportConstructor(t *testing.T) {
-	h, err := New(Transport(func() {}))
-	if err == nil {
-		h.Close()
-		t.Fatal("expected an error")
-	}
-	if !strings.Contains(err.Error(), "libp2p_test.go") {
-		t.Error("expected error to contain debugging info")
-	}
 }
 
 func TestTransportConstructor(t *testing.T) {
@@ -88,14 +89,9 @@ func TestInsecure(t *testing.T) {
 	h.Close()
 }
 
-func TestAutoNATService(t *testing.T) {
-	h, err := New(EnableNATService())
-	require.NoError(t, err)
-	h.Close()
-}
-
 func TestDefaultListenAddrs(t *testing.T) {
 	reTCP := regexp.MustCompile("/(ip)[4|6]/((0.0.0.0)|(::))/tcp/")
+	reQUIC := regexp.MustCompile("/(ip)[4|6]/((0.0.0.0)|(::))/udp/([0-9]*)/quic-v1")
 	reCircuit := regexp.MustCompile("/p2p-circuit")
 
 	// Test 1: Setting the correct listen addresses if userDefined.Transport == nil && userDefined.ListenAddrs == nil
@@ -103,6 +99,7 @@ func TestDefaultListenAddrs(t *testing.T) {
 	require.NoError(t, err)
 	for _, addr := range h.Network().ListenAddresses() {
 		if reTCP.FindStringSubmatchIndex(addr.String()) == nil &&
+			reQUIC.FindStringSubmatchIndex(addr.String()) == nil &&
 			reCircuit.FindStringSubmatchIndex(addr.String()) == nil {
 			t.Error("expected ip4 or ip6 or relay interface")
 		}
@@ -175,6 +172,22 @@ func TestTransportConstructorTCP(t *testing.T) {
 	require.NoError(t, err)
 	defer h.Close()
 	require.NoError(t, h.Network().Listen(ma.StringCast("/ip4/127.0.0.1/tcp/0")))
+	err = h.Network().Listen(ma.StringCast("/ip4/127.0.0.1/udp/0/quic-v1"))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), swarm.ErrNoTransport.Error())
+}
+
+func TestTransportConstructorQUIC(t *testing.T) {
+	h, err := New(
+		Transport(quic.NewTransport),
+		DisableRelay(),
+	)
+	require.NoError(t, err)
+	defer h.Close()
+	require.NoError(t, h.Network().Listen(ma.StringCast("/ip4/127.0.0.1/udp/0/quic-v1")))
+	err = h.Network().Listen(ma.StringCast("/ip4/127.0.0.1/tcp/0"))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), swarm.ErrNoTransport.Error())
 }
 
 type mockTransport struct{}
@@ -223,6 +236,14 @@ func TestTransportConstructorWithoutOpts(t *testing.T) {
 	})
 }
 
+func TestTransportConstructorWithWrongOpts(t *testing.T) {
+	_, err := New(
+		Transport(quic.NewTransport, tcp.DisableReuseport()),
+		DisableRelay(),
+	)
+	require.EqualError(t, err, "transport constructor doesn't take any options")
+}
+
 func TestSecurityConstructor(t *testing.T) {
 	h, err := New(
 		Transport(tcp.NewTCPTransport),
@@ -260,4 +281,187 @@ func TestSecurityConstructor(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "failed to negotiate security protocol")
 	require.NoError(t, h2.Connect(context.Background(), ai))
+}
+
+func TestTransportConstructorWebTransport(t *testing.T) {
+	h, err := New(
+		Transport(webtransport.New),
+		DisableRelay(),
+	)
+	require.NoError(t, err)
+	defer h.Close()
+	require.NoError(t, h.Network().Listen(ma.StringCast("/ip4/127.0.0.1/udp/0/quic-v1/webtransport")))
+	err = h.Network().Listen(ma.StringCast("/ip4/127.0.0.1/udp/0/quic-v1/"))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), swarm.ErrNoTransport.Error())
+}
+
+func TestTransportCustomAddressWebTransport(t *testing.T) {
+	customAddr, err := ma.NewMultiaddr("/ip4/127.0.0.1/udp/0/quic-v1/webtransport")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := New(
+		Transport(webtransport.New),
+		ListenAddrs(customAddr),
+		DisableRelay(),
+		AddrsFactory(func(multiaddrs []ma.Multiaddr) []ma.Multiaddr {
+			return []ma.Multiaddr{customAddr}
+		}),
+	)
+	require.NoError(t, err)
+	defer h.Close()
+	require.NoError(t, h.Network().Listen(ma.StringCast("/ip4/127.0.0.1/udp/0/quic-v1/webtransport")))
+	addrs := h.Addrs()
+	require.Len(t, addrs, 1)
+	require.NotEqual(t, addrs[0], customAddr)
+	restOfAddr, lastComp := ma.SplitLast(addrs[0])
+	restOfAddr, secondToLastComp := ma.SplitLast(restOfAddr)
+	require.Equal(t, ma.P_CERTHASH, lastComp.Protocol().Code)
+	require.Equal(t, ma.P_CERTHASH, secondToLastComp.Protocol().Code)
+	require.True(t, restOfAddr.Equal(customAddr))
+}
+
+// TestTransportCustomAddressWebTransportDoesNotStall tests that if the user
+// manually returns a webtransport address from AddrsFactory, but we aren't
+// listening on a webtranport address, we don't stall.
+func TestTransportCustomAddressWebTransportDoesNotStall(t *testing.T) {
+	customAddr, err := ma.NewMultiaddr("/ip4/127.0.0.1/udp/0/quic-v1/webtransport")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := New(
+		Transport(webtransport.New),
+		// Purposely not listening on the custom address so that we make sure the node doesn't stall if it fails to add a certhash to the multiaddr
+		// ListenAddrs(customAddr),
+		DisableRelay(),
+		AddrsFactory(func(multiaddrs []ma.Multiaddr) []ma.Multiaddr {
+			return []ma.Multiaddr{customAddr}
+		}),
+	)
+	require.NoError(t, err)
+	defer h.Close()
+	addrs := h.Addrs()
+	require.Len(t, addrs, 1)
+	_, lastComp := ma.SplitLast(addrs[0])
+	require.NotEqual(t, ma.P_CERTHASH, lastComp.Protocol().Code)
+	// We did not add the certhash to the multiaddr
+	require.Equal(t, addrs[0], customAddr)
+}
+
+type mockPeerRouting struct {
+	queried []peer.ID
+}
+
+func (r *mockPeerRouting) FindPeer(_ context.Context, id peer.ID) (peer.AddrInfo, error) {
+	r.queried = append(r.queried, id)
+	return peer.AddrInfo{}, errors.New("mock peer routing error")
+}
+
+func TestRoutedHost(t *testing.T) {
+	mockRouter := &mockPeerRouting{}
+	h, err := New(
+		NoListenAddrs,
+		Routing(func(host.Host) (routing.PeerRouting, error) { return mockRouter, nil }),
+		DisableRelay(),
+	)
+	require.NoError(t, err)
+	defer h.Close()
+
+	priv, _, err := crypto.GenerateEd25519Key(rand.Reader)
+	require.NoError(t, err)
+	id, err := peer.IDFromPrivateKey(priv)
+	require.NoError(t, err)
+	require.EqualError(t, h.Connect(context.Background(), peer.AddrInfo{ID: id}), "mock peer routing error")
+	require.Equal(t, []peer.ID{id}, mockRouter.queried)
+}
+
+func TestAutoNATService(t *testing.T) {
+	h, err := New(EnableNATService())
+	require.NoError(t, err)
+	h.Close()
+}
+
+func TestInsecureConstructor(t *testing.T) {
+	h, err := New(
+		EnableNATService(),
+		NoSecurity,
+	)
+	require.NoError(t, err)
+	h.Close()
+
+	h, err = New(
+		NoSecurity,
+	)
+	require.NoError(t, err)
+	h.Close()
+}
+
+func TestAutoNATv2Service(t *testing.T) {
+	h, err := New(EnableAutoNATv2())
+	require.NoError(t, err)
+	h.Close()
+}
+
+func TestDisableIdentifyAddressDiscovery(t *testing.T) {
+	h, err := New(DisableIdentifyAddressDiscovery())
+	require.NoError(t, err)
+	h.Close()
+}
+
+func TestMain(m *testing.M) {
+	goleak.VerifyTestMain(
+		m,
+		// This will return eventually (5s timeout) but doesn't take a context.
+		goleak.IgnoreAnyFunction("github.com/koron/go-ssdp.Search"),
+		// Logging & Stats
+		goleak.IgnoreTopFunction("github.com/ipfs/go-log/v2/writer.(*MirrorWriter).logRoutine"),
+		goleak.IgnoreTopFunction("go.opencensus.io/stats/view.(*worker).start"),
+		goleak.IgnoreAnyFunction("github.com/jackpal/go-nat-pmp.(*Client).GetExternalAddress"),
+	)
+}
+
+func TestDialCircuitAddrWithWrappedResourceManager(t *testing.T) {
+	relay, err := New(EnableRelayService())
+	require.NoError(t, err)
+	defer relay.Close()
+
+	// Fake that the relay is publicly reachable
+	emitterForRelay, err := relay.EventBus().Emitter(&event.EvtLocalReachabilityChanged{})
+	require.NoError(t, err)
+	defer emitterForRelay.Close()
+	emitterForRelay.Emit(event.EvtLocalReachabilityChanged{Reachability: network.ReachabilityPublic})
+
+	peerBehindRelay, err := New(EnableAutoRelayWithStaticRelays([]peer.AddrInfo{{ID: relay.ID(), Addrs: relay.Addrs()}}))
+	require.NoError(t, err)
+	defer peerBehindRelay.Close()
+	// Emit an event to tell this peer it is private
+	emitterForPeerBehindRelay, err := peerBehindRelay.EventBus().Emitter(&event.EvtLocalReachabilityChanged{})
+	require.NoError(t, err)
+	defer emitterForPeerBehindRelay.Close()
+	emitterForPeerBehindRelay.Emit(event.EvtLocalReachabilityChanged{Reachability: network.ReachabilityPrivate})
+
+	// Use a wrapped resource manager to test that the circuit dialing works
+	// with it. Look at the PR introducing this test for context
+	type wrappedRcmgr struct{ network.ResourceManager }
+	mgr, err := rcmgr.NewResourceManager(rcmgr.NewFixedLimiter(rcmgr.DefaultLimits.AutoScale()))
+	require.NoError(t, err)
+	wmgr := wrappedRcmgr{mgr}
+	h, err := New(ResourceManager(wmgr))
+	require.NoError(t, err)
+	defer h.Close()
+
+	h.Peerstore().AddAddrs(relay.ID(), relay.Addrs(), 10*time.Minute)
+	h.Peerstore().AddAddr(peerBehindRelay.ID(),
+		ma.StringCast(
+			fmt.Sprintf("/p2p/%s/p2p-circuit", relay.ID()),
+		),
+		peerstore.TempAddrTTL,
+	)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	res := <-ping.Ping(ctx, h, peerBehindRelay.ID())
+	require.NoError(t, res.Error)
+	defer cancel()
 }

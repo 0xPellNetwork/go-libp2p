@@ -48,8 +48,10 @@ func Wrap(h host.Host, r Routing) *RoutedHost {
 func (rh *RoutedHost) Connect(ctx context.Context, pi peer.AddrInfo) error {
 	// first, check if we're already connected unless force direct dial.
 	forceDirect, _ := network.GetForceDirectDial(ctx)
+	canUseLimitedConn, _ := network.GetAllowLimitedConn(ctx)
 	if !forceDirect {
-		if rh.Network().Connectedness(pi.ID) == network.Connected {
+		connectedness := rh.Network().Connectedness(pi.ID)
+		if connectedness == network.Connected || (canUseLimitedConn && connectedness == network.Limited) {
 			return nil
 		}
 	}
@@ -114,20 +116,21 @@ func (rh *RoutedHost) Connect(ctx context.Context, pi peer.AddrInfo) error {
 		// try to connect again.
 		newAddrs, err := rh.findPeerAddrs(ctx, pi.ID)
 		if err != nil {
-			return fmt.Errorf("failed to find peers: %w", err)
+			log.Debugf("failed to find more peer addresses %s: %s", pi.ID, err)
+			return cerr
 		}
 
 		// Build lookup map
-		lookup := make(map[ma.Multiaddr]struct{}, len(addrs))
+		lookup := make(map[string]struct{}, len(addrs))
 		for _, addr := range addrs {
-			lookup[addr] = struct{}{}
+			lookup[string(addr.Bytes())] = struct{}{}
 		}
 
 		// if there's any address that's not in the previous set
 		// of addresses, try to connect again. If all addresses
 		// where known previously we return the original error.
 		for _, newAddr := range newAddrs {
-			if _, found := lookup[newAddr]; found {
+			if _, found := lookup[string(newAddr.Bytes())]; found {
 				continue
 			}
 

@@ -63,9 +63,10 @@ func NewBlankHost(n network.Network, options ...Option) *BlankHost {
 	}
 
 	bh := &BlankHost{
-		n:    n,
-		cmgr: cfg.cmgr,
-		mux:  mstream.NewMultistreamMuxer[protocol.ID](),
+		n:        n,
+		cmgr:     cfg.cmgr,
+		mux:      mstream.NewMultistreamMuxer[protocol.ID](),
+		eventbus: cfg.eventBus,
 	}
 	if bh.eventbus == nil {
 		bh.eventbus = eventbus.NewBus(eventbus.WithMetricsTracer(eventbus.NewMetricsTracer()))
@@ -78,11 +79,6 @@ func NewBlankHost(n network.Network, options ...Option) *BlankHost {
 	if bh.emitters.evtLocalProtocolsUpdated, err = bh.eventbus.Emitter(&event.EvtLocalProtocolsUpdated{}); err != nil {
 		return nil
 	}
-	evtPeerConnectednessChanged, err := bh.eventbus.Emitter(&event.EvtPeerConnectednessChanged{})
-	if err != nil {
-		return nil
-	}
-	n.Notify(newPeerConnectWatcher(evtPeerConnectednessChanged))
 
 	n.SetStreamHandler(bh.newStreamHandler)
 
@@ -141,6 +137,9 @@ func (bh *BlankHost) Connect(ctx context.Context, ai peer.AddrInfo) error {
 	}
 
 	_, err := bh.Network().DialPeer(ctx, ai.ID)
+	if err != nil {
+		return fmt.Errorf("failed to dial: %w", err)
+	}
 	return err
 }
 
@@ -155,13 +154,13 @@ func (bh *BlankHost) ID() peer.ID {
 func (bh *BlankHost) NewStream(ctx context.Context, p peer.ID, protos ...protocol.ID) (network.Stream, error) {
 	s, err := bh.n.NewStream(ctx, p)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to open stream: %w", err)
 	}
 
 	selected, err := mstream.SelectOneOf(protos, s)
 	if err != nil {
 		s.Reset()
-		return nil, err
+		return nil, fmt.Errorf("failed to negotiate protocol: %w", err)
 	}
 
 	s.SetProtocol(selected)
@@ -212,7 +211,7 @@ func (bh *BlankHost) newStreamHandler(s network.Stream) {
 
 	s.SetProtocol(protoID)
 
-	go handle(protoID, s)
+	handle(protoID, s)
 }
 
 // TODO: i'm not sure this really needs to be here

@@ -2,13 +2,17 @@ package client_test
 
 import (
 	"context"
+	"errors"
 	"math"
 	"testing"
 	"time"
 
 	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/record"
+	"github.com/libp2p/go-libp2p/core/test"
 	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
 	pbv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/pb"
 	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/proto"
@@ -22,6 +26,7 @@ func TestReservationFailures(t *testing.T) {
 		name          string
 		streamHandler network.StreamHandler
 		err           string
+		status        pbv2.Status
 	}
 	testcases := []testcase{
 		{
@@ -36,7 +41,8 @@ func TestReservationFailures(t *testing.T) {
 					Type: pbv2.HopMessage_RESERVE.Enum(),
 				})
 			},
-			err: "unexpected relay response: not a status message",
+			err:    "unexpected relay response: not a status message",
+			status: pbv2.Status_MALFORMED_MESSAGE,
 		},
 		{
 			name: "unknown status",
@@ -47,7 +53,8 @@ func TestReservationFailures(t *testing.T) {
 					Status: &status,
 				})
 			},
-			err: "reservation failed",
+			err:    "reservation failed",
+			status: pbv2.Status(1337),
 		},
 		{
 			name: "invalid time",
@@ -60,7 +67,8 @@ func TestReservationFailures(t *testing.T) {
 					Reservation: &pbv2.Reservation{Expire: &expire},
 				})
 			},
-			err: "received reservation with expiration date in the past",
+			err:    "received reservation with expiration date in the past",
+			status: pbv2.Status_MALFORMED_MESSAGE,
 		},
 		{
 			name: "invalid voucher",
@@ -76,7 +84,47 @@ func TestReservationFailures(t *testing.T) {
 					},
 				})
 			},
-			err: "error consuming voucher envelope: failed when unmarshalling the envelope",
+			err:    "error consuming voucher envelope: failed when unmarshalling the envelope",
+			status: pbv2.Status_MALFORMED_MESSAGE,
+		},
+		{
+			name: "invalid voucher 2",
+			streamHandler: func(s network.Stream) {
+				status := pbv2.Status_OK
+				expire := uint64(time.Now().Add(time.Hour).UnixNano())
+				priv, _, err := test.RandTestKeyPair(crypto.Ed25519, 256)
+				if err != nil {
+					s.Reset()
+					return
+				}
+				relay, _ := test.RandPeerID()
+				peer, _ := test.RandPeerID()
+				voucher := &proto.ReservationVoucher{
+					Relay:      relay,
+					Peer:       peer,
+					Expiration: time.Now().Add(time.Hour),
+				}
+				signedVoucher, err := record.Seal(voucher, priv)
+				if err != nil {
+					s.Reset()
+					return
+				}
+				env, err := signedVoucher.Marshal()
+				if err != nil {
+					s.Reset()
+					return
+				}
+				util.NewDelimitedWriter(s).WriteMsg(&pbv2.HopMessage{
+					Type:   pbv2.HopMessage_STATUS.Enum(),
+					Status: &status,
+					Reservation: &pbv2.Reservation{
+						Expire:  &expire,
+						Voucher: env,
+					},
+				})
+			},
+			err:    "invalid voucher relay id",
+			status: pbv2.Status_MALFORMED_MESSAGE,
 		},
 	}
 
@@ -98,6 +146,15 @@ func TestReservationFailures(t *testing.T) {
 			} else {
 				require.Error(t, err)
 				require.Contains(t, err.Error(), tc.err)
+				if tc.status != 0 {
+					var re client.ReservationError
+					if !errors.As(err, &re) {
+						t.Errorf("expected error to be of type %T", re)
+					}
+					if re.Status != tc.status {
+						t.Errorf("expected status %d got %d", tc.status, re.Status)
+					}
+				}
 			}
 		})
 	}

@@ -4,16 +4,16 @@
     "transports": [
         "tcp",
         "ws",
-        "quic",
+        "wss",
         "quic-v1",
-        "webtransport"
+        "webtransport",
+        "webrtc-direct"
     ],
     "secureChannels": [
         "tls",
         "noise"
     ],
     "muxers": [
-        "mplex",
         "yamux"
     ]
 }

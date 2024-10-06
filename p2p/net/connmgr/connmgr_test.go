@@ -367,7 +367,7 @@ func TestDoubleConnection(t *testing.T) {
 	not.Connected(nil, conn)
 	cm.TagPeer(conn.RemotePeer(), "foo", 10)
 	not.Connected(nil, conn)
-	if cm.connCount != 1 {
+	if cm.connCount.Load() != 1 {
 		t.Fatal("unexpected number of connections")
 	}
 	if cm.segments.get(conn.RemotePeer()).peers[conn.RemotePeer()].value != 10 {
@@ -386,7 +386,7 @@ func TestDisconnected(t *testing.T) {
 	cm.TagPeer(conn.RemotePeer(), "foo", 10)
 
 	not.Disconnected(nil, randConn(t, nil))
-	if cm.connCount != 1 {
+	if cm.connCount.Load() != 1 {
 		t.Fatal("unexpected number of connections")
 	}
 	if cm.segments.get(conn.RemotePeer()).peers[conn.RemotePeer()].value != 10 {
@@ -394,7 +394,7 @@ func TestDisconnected(t *testing.T) {
 	}
 
 	not.Disconnected(nil, &tconn{peer: conn.RemotePeer()})
-	if cm.connCount != 1 {
+	if cm.connCount.Load() != 1 {
 		t.Fatal("unexpected number of connections")
 	}
 	if cm.segments.get(conn.RemotePeer()).peers[conn.RemotePeer()].value != 10 {
@@ -402,7 +402,7 @@ func TestDisconnected(t *testing.T) {
 	}
 
 	not.Disconnected(nil, conn)
-	if cm.connCount != 0 {
+	if cm.connCount.Load() != 0 {
 		t.Fatal("unexpected number of connections")
 	}
 	if cm.segments.countPeers() != 0 {
@@ -495,7 +495,7 @@ func TestQuickBurstRespectsSilencePeriod(t *testing.T) {
 	if closed > 20 {
 		t.Fatalf("should have closed at most 20 connections, closed: %d", closed)
 	}
-	if total := closed + int(cm.connCount); total != 30 {
+	if total := closed + int(cm.connCount.Load()); total != 30 {
 		t.Fatalf("expected closed connections + open conn count to equal 30, value: %d", total)
 	}
 }
@@ -662,7 +662,6 @@ func TestPeerProtectionMultipleTags(t *testing.T) {
 			t.Error("protected connection was closed by connection manager")
 		}
 	}
-
 }
 
 func TestPeerProtectionIdempotent(t *testing.T) {
@@ -796,13 +795,13 @@ type mockConn struct {
 
 func (m mockConn) Close() error                                          { panic("implement me") }
 func (m mockConn) LocalPeer() peer.ID                                    { panic("implement me") }
-func (m mockConn) LocalPrivateKey() crypto.PrivKey                       { panic("implement me") }
 func (m mockConn) RemotePeer() peer.ID                                   { panic("implement me") }
 func (m mockConn) RemotePublicKey() crypto.PubKey                        { panic("implement me") }
 func (m mockConn) LocalMultiaddr() ma.Multiaddr                          { panic("implement me") }
 func (m mockConn) RemoteMultiaddr() ma.Multiaddr                         { panic("implement me") }
 func (m mockConn) Stat() network.ConnStats                               { return m.stats }
 func (m mockConn) ID() string                                            { panic("implement me") }
+func (m mockConn) IsClosed() bool                                        { panic("implement me") }
 func (m mockConn) NewStream(ctx context.Context) (network.Stream, error) { panic("implement me") }
 func (m mockConn) GetStreams() []network.Stream                          { panic("implement me") }
 func (m mockConn) Scope() network.ConnScope                              { panic("implement me") }
@@ -835,7 +834,7 @@ func TestPeerInfoSorting(t *testing.T) {
 		p2 := &peerInfo{id: peer.ID("peer2"), temp: true}
 		pis := peerInfos{p1, p2}
 		pis.SortByValueAndStreams(makeSegmentsWithPeerInfos(pis), false)
-		require.Equal(t, pis, peerInfos{p2, p1})
+		require.Equal(t, peerInfos{p2, p1}, pis)
 	})
 
 	t.Run("starts with low-value connections", func(t *testing.T) {
@@ -843,7 +842,7 @@ func TestPeerInfoSorting(t *testing.T) {
 		p2 := &peerInfo{id: peer.ID("peer2"), value: 20}
 		pis := peerInfos{p1, p2}
 		pis.SortByValueAndStreams(makeSegmentsWithPeerInfos(pis), false)
-		require.Equal(t, pis, peerInfos{p2, p1})
+		require.Equal(t, peerInfos{p2, p1}, pis)
 	})
 
 	t.Run("prefer peers with no streams", func(t *testing.T) {
@@ -859,7 +858,7 @@ func TestPeerInfoSorting(t *testing.T) {
 		}
 		pis := peerInfos{p2, p1}
 		pis.SortByValueAndStreams(makeSegmentsWithPeerInfos(pis), false)
-		require.Equal(t, pis, peerInfos{p1, p2})
+		require.Equal(t, peerInfos{p1, p2}, pis)
 	})
 
 	t.Run("in a memory emergency, starts with incoming connections and higher streams", func(t *testing.T) {
@@ -902,7 +901,7 @@ func TestPeerInfoSorting(t *testing.T) {
 		// p3 is first because it is inactive (no streams).
 		// p4 is second because it has the most streams and we priortize killing
 		// connections with the higher number of streams.
-		require.Equal(t, pis, peerInfos{p3, p4, p2, p1})
+		require.Equal(t, peerInfos{p3, p4, p2, p1}, pis)
 	})
 
 	t.Run("in a memory emergency, starts with connections that have many streams", func(t *testing.T) {
@@ -921,7 +920,7 @@ func TestPeerInfoSorting(t *testing.T) {
 		}
 		pis := peerInfos{p1, p2}
 		pis.SortByValueAndStreams(makeSegmentsWithPeerInfos(pis), true)
-		require.Equal(t, pis, peerInfos{p2, p1})
+		require.Equal(t, peerInfos{p2, p1}, pis)
 	})
 }
 
@@ -965,4 +964,25 @@ func TestSafeConcurrency(t *testing.T) {
 
 		wg.Wait()
 	})
+}
+
+func TestCheckLimit(t *testing.T) {
+	low, hi := 1, 2
+	cm, err := NewConnManager(low, hi)
+	require.NoError(t, err)
+
+	err = cm.CheckLimit(testLimitGetter{hi + 1})
+	require.NoError(t, err)
+	err = cm.CheckLimit(testLimitGetter{hi})
+	require.NoError(t, err)
+	err = cm.CheckLimit(testLimitGetter{hi - 1})
+	require.Error(t, err)
+}
+
+type testLimitGetter struct {
+	limit int
+}
+
+func (g testLimitGetter) GetConnLimit() int {
+	return g.limit
 }

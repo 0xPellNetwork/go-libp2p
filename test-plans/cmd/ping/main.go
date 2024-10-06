@@ -2,26 +2,34 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/big"
 	"os"
 	"strconv"
 	"time"
 
+	libp2pwebrtc "github.com/libp2p/go-libp2p/p2p/transport/webrtc"
+
 	"github.com/go-redis/redis/v8"
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/p2p/muxer/mplex"
 	"github.com/libp2p/go-libp2p/p2p/muxer/yamux"
 	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
-	noise "github.com/libp2p/go-libp2p/p2p/security/noise"
+	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	libp2ptls "github.com/libp2p/go-libp2p/p2p/security/tls"
 	libp2pquic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
 	"github.com/libp2p/go-libp2p/p2p/transport/websocket"
 	libp2pwebtransport "github.com/libp2p/go-libp2p/p2p/transport/webtransport"
 	ma "github.com/multiformats/go-multiaddr"
+	manet "github.com/multiformats/go-multiaddr/net"
 )
 
 func main() {
@@ -85,18 +93,21 @@ func main() {
 	case "ws":
 		options = append(options, libp2p.Transport(websocket.New))
 		listenAddr = fmt.Sprintf("/ip4/%s/tcp/0/ws", ip)
+	case "wss":
+		options = append(options, libp2p.Transport(websocket.New, websocket.WithTLSConfig(generateTLSConfig()), websocket.WithTLSClientConfig(&tls.Config{InsecureSkipVerify: true})))
+		listenAddr = fmt.Sprintf("/ip4/%s/tcp/0/wss", ip)
 	case "tcp":
 		options = append(options, libp2p.Transport(tcp.NewTCPTransport))
 		listenAddr = fmt.Sprintf("/ip4/%s/tcp/0", ip)
-	case "quic":
-		options = append(options, libp2p.Transport(libp2pquic.NewTransport))
-		listenAddr = fmt.Sprintf("/ip4/%s/udp/0/quic", ip)
 	case "quic-v1":
 		options = append(options, libp2p.Transport(libp2pquic.NewTransport))
 		listenAddr = fmt.Sprintf("/ip4/%s/udp/0/quic-v1", ip)
 	case "webtransport":
 		options = append(options, libp2p.Transport(libp2pwebtransport.New))
 		listenAddr = fmt.Sprintf("/ip4/%s/udp/0/quic-v1/webtransport", ip)
+	case "webrtc-direct":
+		options = append(options, libp2p.Transport(libp2pwebrtc.New))
+		listenAddr = fmt.Sprintf("/ip4/%s/udp/0/webrtc-direct", ip)
 	default:
 		log.Fatalf("Unsupported transport: %s", transport)
 	}
@@ -106,13 +117,11 @@ func main() {
 	var skipMuxer bool
 	var skipSecureChannel bool
 	switch transport {
-	case "quic":
-		fallthrough
 	case "quic-v1":
 		fallthrough
 	case "webtransport":
 		fallthrough
-	case "webrtc":
+	case "webrtc-direct":
 		skipMuxer = true
 		skipSecureChannel = true
 	}
@@ -132,8 +141,6 @@ func main() {
 		switch muxer {
 		case "yamux":
 			options = append(options, libp2p.Muxer("/yamux/1.0.0", yamux.DefaultTransport))
-		case "mplex":
-			options = append(options, libp2p.Muxer("/mplex/6.7.0", mplex.DefaultTransport))
 		default:
 			log.Fatalf("Unsupported muxer: %s", muxer)
 		}
@@ -192,11 +199,43 @@ func main() {
 		}
 		fmt.Println(string(testResultJSON))
 	} else {
-		_, err := rClient.RPush(ctx, "listenerAddr", host.Addrs()[0].Encapsulate(ma.StringCast("/p2p/"+host.ID().String())).String()).Result()
+		var listenAddr ma.Multiaddr
+		for _, addr := range host.Addrs() {
+			if !manet.IsIPLoopback(addr) {
+				listenAddr = addr
+				break
+			}
+		}
+		_, err := rClient.RPush(ctx, "listenerAddr", listenAddr.Encapsulate(ma.StringCast("/p2p/"+host.ID().String())).String()).Result()
 		if err != nil {
 			log.Fatal("Failed to send listener address")
 		}
 		time.Sleep(testTimeout)
 		os.Exit(1)
+	}
+}
+
+func generateTLSConfig() *tls.Config {
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		log.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{},
+		SignatureAlgorithm:    x509.SHA256WithRSA,
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(time.Hour), // valid for an hour
+		BasicConstraintsValid: true,
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, priv.Public(), priv)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{{
+			PrivateKey:  priv,
+			Certificate: [][]byte{certDER},
+		}},
 	}
 }
